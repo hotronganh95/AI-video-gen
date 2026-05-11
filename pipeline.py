@@ -91,6 +91,9 @@ class Scene:
     # Review 2-pass: beat thuộc đoạn dàn ý nào (đánh dấu section trong scenes.json)
     outline_section_number: int | None = None
     outline_section_summary: str = ""
+    # WAN 2.1 I2V motion prompt: chuỗi tiếng Anh mô tả CHUYỂN ĐỘNG cho beat này
+    # (không tả lại nhân vật/wardrobe — ảnh tĩnh đã khoá). Dùng để đẩy thẳng vào WAN 2.1.
+    motion_prompt: str = ""
 
 
 def _strip_json_fence(text: str) -> str:
@@ -382,6 +385,15 @@ _TTS_BEAT_TARGET_SEC = 5.0
 _TTS_BEAT_MAX_SEC = 8.0
 _TTS_BEAT_TARGET_SYLL = int(_TTS_SYLL_PER_SEC * _TTS_BEAT_TARGET_SEC)  # 15
 _TTS_BEAT_MAX_SYLL = int(_TTS_SYLL_PER_SEC * _TTS_BEAT_MAX_SEC)  # 24
+_LONG_BEAT_AUTO_SPLIT_SEC = 10.0
+
+
+def _tts_seconds_for_text(text: str) -> float:
+    return _count_tts_syllables(text or "") / _TTS_SYLL_PER_SEC
+
+
+def _long_beat_syllable_threshold(tts_sec: float) -> int:
+    return max(1, int(_TTS_SYLL_PER_SEC * float(tts_sec)))
 
 
 def _warn_long_story_text_beats(scenes: list[Scene]) -> int:
@@ -430,6 +442,80 @@ def _label_from_ref_filename(fn: str) -> str:
     base = base.replace("_", " ").strip()
     base = re.sub(r"\s+", " ", base)
     return base
+
+
+# WAN 2.1 I2V (image-to-video) motion-prompt rules — DRY block, inject vào cả 2 planner prompts
+# (2-pass beats_prompt và 1-pass review prompt). Buộc planner sinh ra prompt chuyển động cụ thể,
+# verb đo lường được, một take liên tục, đúng quy ước WAN 2.1.
+_WAN_MOTION_PROMPT_RULES: str = """\
+9. motionPrompt — REQUIRED FIELD, MUST appear in EVERY beat object (never omit, never leave empty).
+   This is a WAN 2.1 image-to-video (I2V) prompt that animates THIS beat's still image into a short clip
+   (~3–5 seconds, matching the storyText TTS length). ALWAYS write in ENGLISH regardless of source language;
+   use ASCII apostrophes (not curly quotes). Length target: 60–110 words.
+
+   WAN 2.1 I2V CONVENTIONS — STRICT (follow ALL):
+   (a) Do NOT re-describe wardrobe / identity / setting / lighting / palette — the input still image already locks all of those. Describe ONLY what MOVES during the clip.
+   (b) Use ROLES, not source-language proper nouns: "the young woman", "the stern young prince", "the masked sister", "the elderly emperor", "the general", "the past princess", "the messenger", etc.
+   (c) FOCUS ON CHARACTER (subject) MOTION with CONCRETE kinetic verbs anchored to measurable body parts. Include at least 2 of:
+       • Body: "chest rises and falls with one slow breath", "shoulders rise then drop", "she takes one half-step forward", "his torso leans forward 5 degrees".
+       • Head: "chin tilts down 5 degrees", "head turns 10 degrees toward [role]", "single slow nod", "chin lifts a touch".
+       • Eyes: "blinks once slowly", "lashes lower then lift", "eyes flick to the right then back", "gaze locks toward [role]".
+       • Mouth: "lips part about half a centimetre and close again", "the corners of his mouth pull upward into a clear smirk". For DIALOGUE beats: "lips part and close in a clear speaking rhythm — short pauses every two beats".
+       • Hands: "right hand lifts and points sharply", "fingertips slowly curl tighter into sleeve fabric", "fingers wrap around the cup".
+   (d) Add ONE camera move (pick one only): "slow dolly-in", "slow lateral pan-right", "very slow micro push-in", "static eye-level hold", "slow drift across hand to face", "slow truck-left following her movement".
+   (e) Add ambient motion if appropriate: "dust motes drift in shafts of light", "loose hair strands flutter in the breeze", "distant banners ripple", "candle flames flicker", "embers and dust swirl past them".
+   (f) FORBIDDEN softeners (NEVER use any of these in motionPrompt) — WAN translates them as "frozen subject" and outputs only camera + ambient motion: "subtle", "barely", "imperceptible", "a fraction", "almost", "slight movement", "nearly motionless", "remains motionless", "stands still" (unless followed by an explicit body-anchor verb in the same sentence).
+   (g) ONE CONTINUOUS TAKE — WAN cannot cut, dissolve, or rack-focus across multiple subjects mid-clip. FORBIDDEN words/phrases in motionPrompt: "montage", "cross-dissolve", "cuts to", "rack focus", "split screen", "then we cut to". Pick ONE primary action chain in ONE place.
+   (h) DIALOGUE beats (a character speaks): WAN cannot lipsync from text alone. Describe lips/mouth motion in clear speaking rhythm with body anchors (head bobs, breath, hand gesture), then APPEND at the end of the prompt: "(lipsync polished in post)".
+   (i) FLASHBACK beats: briefly carry the memory-grade register from pageContent into the motion clip (e.g. "cool desaturated memory grade with slight grain", "soft sepia memory tone with subtle vignette"). One short clause is enough.
+   (j) ENV-ONLY beats (no characters in pageContent): describe ONLY environment motion (mist rolls slowly, dust drifts, banners ripple, candles flicker, particles swirl through cracks). Do NOT add the "Subject motion priority" suffix.
+   (k) END every CHARACTER beat with this exact cue line: "Subject motion priority over camera; characters move clearly, not frozen." Then add a duration + framerate tag: "5s, 24fps" (use "3s, 24fps" for very short story lines like a single word, or "6s, 24fps" for the rare beat near the 8s ceiling).
+   (l) NO source-language proper nouns inside motionPrompt. NO rendered text. NO captions / subtitles / speech bubbles / signs.
+
+   STRUCTURE — write motionPrompt in this order, as ONE plain prose paragraph (no bullets):
+     [subject action chain with concrete kinetic verbs + body anchors] [one camera move] [ambient motion if appropriate] [memory-grade tag if flashback] [Subject motion priority cue if a character is in frame] [duration + fps tag]
+
+   GOOD EXAMPLE (dialogue close-up):
+     "The general's lips part and close in a clear natural speaking rhythm with short pauses every two beats; his chin bows half an inch lower at the end of each phrase, then rises again; he blinks once slowly; his shoulders rise and fall with two calm breaths. Static eye-level hold, medium close-up. Soft autumn breeze on hair and collar fabric, distant banners ripple in shallow DoF. Subject motion priority over camera; characters move clearly, not frozen. (lipsync polished in post) 5s, 24fps."
+
+   GOOD EXAMPLE (env-only flashback):
+     "A weathered ancient stone wall stands against pale sky; a gentle visible breeze of swirling light particles and thin dust flows through cracks and gaps, a small trail spilling out the other side. Very slow push-in toward the cracks, low-angle wide shot. Soft sepia memory tone with subtle vignette, drifting motes. 5s, 24fps."
+
+   BAD EXAMPLE (DO NOT emit anything like this):
+     "She has a subtle smile, lips barely move, almost imperceptible breath. Slow rack focus from her to him then montage of memories." → multiple forbidden tokens; WAN will produce a frozen still.
+
+HARD REMINDER — `motionPrompt` is FIELD #9 of the required JSON schema, NOT optional commentary.
+Every beat object you emit MUST contain a non-empty `motionPrompt` string. If a beat is reflective or
+mostly internal monologue with no obvious motion, default to a minimal valid prompt such as:
+"The character draws one slow breath; chest rises and falls once; lashes lower then lift in a single slow blink; chin tilts down half an inch then settles. Static eye-level hold, medium close-up. Soft ambient air movement around hair and collar. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+NEVER omit `motionPrompt`. NEVER set it to null, empty string, "TBD", or a placeholder.
+"""
+
+# Planner beat-split rules — split by illustration rhythm (one still per visual beat), not grammar alone.
+_VISUAL_RHYTHM_SPLIT_RULES: str = """\
+VISUAL RHYTHM SPLIT — PLAN BY ILLUSTRATION BEATS, NOT GRAMMAR ALONE (CRITICAL):
+- Split by what could be ONE still frame + ONE short motion clip, NOT by how many commas a sentence has.
+- Before finalizing each beat, count DISTINCT visual beats inside its storyText:
+  • a new physical action or gesture (mask on, carry, sit, feed, apply medicine, stand, turn);
+  • a new place or staging (open road → abandoned hut interior → bedside);
+  • a new time slice that changes the tableau (arrival vs multi-day vigil vs recovery / "pulled back from death's door");
+  • a new prop or contact (bowl, medicine, bed, scroll);
+  • a new dialogue turn or emotional beat.
+  If you count 2+ DISTINCT visuals, SPLIT into 2+ beats with verbatim storyText slices.
+- One long source sentence often becomes 2–4 beats when the narration walks through multiple illustrated moments.
+- HARD CHECK: pageContent must describe ONLY what storyText covers for THAT beat. If pageContent shows bedside nursing but storyText also covers carrying someone into the hut and pulling them back from death's door, you MERGED too much — split storyText first, then write pageContent per slice.
+- When the visual beat changes, choose a NEW shot / staging (wide arrival → medium care → close-up recovery), even inside flashback.
+- Do NOT merge unlike visuals to save JSON size. Prefer MORE beats over one overloaded image.
+
+Example D — one long sentence → 2–3 images (STRUCTURE only; anchors/storyText must be VERBATIM from the user's source):
+  Source (fictional, any language): "She masked her face, carried him into an abandoned watchpost, shared the bed for three days and nights, fed him and changed his medicine, and fiercely pulled him back from the edge of death."
+  WRONG → 1 beat / 1 image cramming mask + carry + multi-day vigil + recovery.
+  CORRECT → often 2–3 beats:
+    • Beat 1 (flashback): masked carry into the abandoned post — wide / medium, movement.
+    • Beat 2 (flashback): bedside vigil — feeding water, applying medicine — medium close-up; "three days and nights" may stay in this beat only if it is ONE continuous nursing tableau.
+    • Beat 3 (flashback): revival / edge-of-death — close-up on breath, eyes, or gripping hands — outcome beat.
+  If arrival, vigil, and outcome are each drawable as separate moments, prefer 3 beats over 2.
+"""
 
 
 # Prefix kính ngữ / danh xưng / chức danh phổ biến — dùng để cắt prefix khi match label nhân vật
@@ -1131,6 +1217,26 @@ NHIỆM VỤ — CHỈ làm hai việc dưới đây, không làm gì khác:
      "ckung" → "chung", "lik" → "thích", "trc" → "trước", "sv" → "sinh viên" (chỉ khi rõ context), "bik" → "biết",
      "h" → "giờ" (khi rõ là "8h sáng"), "iu" → "yêu", "z" → "vậy", "đg" → "đang".
    • Sửa lỗi đánh máy / dấu rõ ràng: "tôi yêu việt nam" → "tôi yêu Việt Nam" CHỈ khi danh từ riêng đã viết hoa nhầm; sai dấu hỏi/ngã rõ ràng theo từ điển ("sửa" vs "sữa": chọn theo nghĩa câu).
+   • SỬA LỖI DẤU THEO NGỮ CẢNH (CRITICAL — kể cả khi CẢ 2 dạng đều là từ tiếng Việt hợp lệ về từ điển):
+     Quy tắc: nếu một dấu trên chữ làm thay đổi NGHĨA / TỪ LOẠI, và dạng còn lại KHÔNG khớp vai trò ngữ pháp
+     trong câu, BẮT BUỘC sửa về dạng đúng theo ngữ cảnh. Phổ biến trong văn bản convert từ truyện Trung sang Việt:
+     - "Hắn" (đại từ ngôi 3 nam: he/him) ↔ "Hẳn" (trạng từ: chắc chắn, đích thị).
+         • Nếu chủ ngữ của câu là "Hẳn/Hắn" + động từ (Hẳn nói / cười / đi / nhìn / quỳ / bước / nâng…) HOẶC "Hẳn/Hắn" là tân ngữ (gặp hẳn, theo hắn, nhìn hắn) → BẮT BUỘC là "Hắn".
+         • Chỉ giữ "Hẳn" khi nó là TRẠNG TỪ bổ nghĩa cho động từ/tính từ ngay sau ("hẳn là", "hẳn không biết", "hẳn rồi"). Test: thay được bằng "chắc chắn" mà câu vẫn nghĩa → đúng là "Hẳn".
+         • Ví dụ: "Hẳn trước mặt tất cả mọi người xin thánh chỉ ban hôn." → "Hắn trước mặt tất cả mọi người xin thánh chỉ ban hôn." (chủ ngữ là người).
+         • Ví dụ: "Hẳn không biết chuyện này." → giữ nguyên (= "chắc chắn không biết").
+     - "Cố" (họ: Cố Thiên Từ / Cố phủ; hoặc động từ: cố gắng, cố ý) ↔ "Cô" (cô gái / đại từ ngôi 2-3 nữ trẻ). Phân biệt theo vai trò trong cụm danh từ.
+     - "Hằn" (vết hằn, ấn tượng) ↔ "Hắn" (đại từ ngôi 3) — nếu đi sau "thằng/tên/gã" hoặc đứng chủ ngữ → "Hắn".
+     - "Nàng" (đại từ ngôi 3 nữ trong văn cổ trang) ↔ "Nãng" (gần như chắc chắn là LỖI; sửa về "Nàng").
+     - "Chàng" (đại từ ngôi 3 nam trong văn cổ trang) ↔ "Chãng" (LỖI; sửa về "Chàng").
+     - "Lão" (cụ già / tiền tố tôn xưng) ↔ "Láo" (hỗn xược).
+     - "Vương" (vua / họ) ↔ "Vướng" (mắc kẹt).
+     - "Mặt" (face) ↔ "Mạt" (cuối, tận) — chọn theo nghĩa câu.
+     - "Vẫn" (still) ↔ "Vận" (vận chuyển / số phận) — chọn theo nghĩa câu.
+     - "Ngẩng" (ngẩng đầu) ↔ "Ngẳng" (LỖI; sửa về "Ngẩng").
+     - "Thái tử" (correct) ↔ "Thái tữ" / "Thái tử̛" (LỖI; sửa về "Thái tử").
+     - "Tỷ" (tỷ tỷ — chị) ↔ "Tỉ" (tỉ lệ) — chọn theo nghĩa.
+     Heuristic chung: đọc CẢ CÂU; xác định VAI TRÒ NGỮ PHÁP của chữ nghi vấn (chủ ngữ / tân ngữ / trạng từ / tính từ / danh từ riêng); chọn dạng dấu khớp NGHĨA câu. Nếu cả 2 dạng đều có thể đứng được nhưng truyện đang dùng nhất quán một đại từ ngôi 3 ("hắn" / "nàng" / "y"…) ở các câu khác → bám theo dạng nhất quán đó.
    • TUYỆT ĐỐI KHÔNG sửa: phương ngữ vùng miền ("đi mô", "biết răng", "chi rứa", "có chi", "mần chi"…), tiếng lóng cố ý của truyện, văn phong cổ trang ("nàng", "chàng", "ngươi", "thiếp", "phu nhân"), từ Hán-Việt.
    • TUYỆT ĐỐI KHÔNG đổi từ đồng nghĩa: "thấy" KHÔNG đổi thành "trông thấy"; "đẹp" KHÔNG đổi thành "xinh đẹp"; "nói" KHÔNG đổi thành "thốt".
    • TUYỆT ĐỐI KHÔNG đổi xưng hô: tôi/tớ/mình/em/chị/anh/chú/bác/mày/tao/ngươi/thiếp/chàng… giữ nguyên 100%.
@@ -1378,6 +1484,7 @@ def _manifest_dict_to_scene(d: dict[str, Any]) -> Scene:
         narrative_plane=_parse_narrative_plane(d),
         outline_section_number=osn,
         outline_section_summary=oss,
+        motion_prompt=str(d.get("motionPrompt", "") or ""),
     )
 
 
@@ -1405,6 +1512,8 @@ def scene_to_manifest_dict(s: Scene, mode: str) -> dict[str, Any]:
             item["outlineSectionNumber"] = s.outline_section_number
         if (s.outline_section_summary or "").strip():
             item["outlineSectionSummary"] = s.outline_section_summary
+        if (s.motion_prompt or "").strip():
+            item["motionPrompt"] = s.motion_prompt
     return item
 
 
@@ -1746,6 +1855,8 @@ DURATION RULE — EVERY BEAT MUST FIT 3–5 SECONDS OF NARRATION; NEVER EXCEED ~
 - SHORT beats are encouraged (one clause, ~3–10 syllables/words). A beat longer than one sentence is a SIGN to split further.
 - Direct dialogue: each short utterance / each speaker turn / each pause-marked phrase → one beat. A long line of dialogue must be split at commas or natural breath points.
 
+{_VISUAL_RHYTHM_SPLIT_RULES}
+
 GRANULARITY RULE — ONE BEAT = ONE FRAME = ONE MOMENT (CRITICAL):
 - A beat is ONE freeze-frame illustration. It can show only ONE point in time, ONE place, ONE state of action.
 - You MUST NOT cram multiple events / time points / locations into a single beat. If the prose moves through several moments, CREATE one beat per moment.
@@ -1832,8 +1943,10 @@ For each beat:
      A subsequent beat whose dialogue mentions a third character C who is NOT in the room → refs are [A, B] only; do NOT add C.
 8. narrativePlane: "present" or "flashback" (required).
 
-Return ONLY a JSON array with keys:
-"pageNumber", "storySegment", "startAnchor", "endAnchor", "storyText", "pageContent", "panelCount", "suggestedReferences", "narrativePlane".
+{_WAN_MOTION_PROMPT_RULES}
+
+Return ONLY a JSON array with keys (EVERY object MUST contain ALL 10 keys, including a non-empty `motionPrompt` string — see rule 9 above):
+"pageNumber", "storySegment", "startAnchor", "endAnchor", "storyText", "pageContent", "panelCount", "suggestedReferences", "narrativePlane", "motionPrompt".
 Number pageNumber starting at 1 within this section (it will be renumbered).
 """
 
@@ -1987,7 +2100,7 @@ def split_story_into_scenes(
             "a logical sequence of illustrative sections"
             if app_mode == "storybook"
             else (
-                "a rich sequence of fine-grained illustration beats — each beat must be ~3–5 seconds of TTS narration (max 8s); split aggressively, one sentence often becomes 2–4 beats"
+                "a rich sequence of fine-grained illustration beats — each beat must be ~3–5 seconds of TTS narration (max 8s); split aggressively by visual rhythm (one still per drawable moment), one sentence often becomes 2–4 beats"
                 if app_mode == "review"
                 else "a logical sequence of manga pages"
             )
@@ -2072,6 +2185,8 @@ DURATION RULE — EVERY BEAT MUST FIT 3–5 SECONDS OF NARRATION; NEVER EXCEED ~
 - Splitting a long sentence: split at commas / semicolons / colons / em-dashes / coordinating conjunctions ("and", "but", "then", "so", or their equivalents in the source language); split between two clauses; split between a physical action and an inner thought; a 2–3-clause sentence becomes 2–3 beats.
 - SHORT beats are encouraged (one clause, ~3–10 syllables/words). A beat longer than one sentence is a SIGN to split further.
 - Direct dialogue: each short utterance / each speaker turn / each pause-marked phrase → one beat.
+
+{_VISUAL_RHYTHM_SPLIT_RULES}
 
 GRANULARITY RULE — ONE BEAT = ONE FRAME = ONE MOMENT (CRITICAL):
 - A beat is ONE freeze-frame illustration. It can show only ONE point in time, ONE place, ONE state of action.
@@ -2165,8 +2280,10 @@ For each beat, define:
      - a beat whose dialogue mentions a third character not in the frame → do NOT add a ref for that third character.
 8. narrativePlane: "present" or "flashback" (required).
 
-Return ONLY a JSON array of objects with the keys:
-"pageNumber", "storySegment", "startAnchor", "endAnchor", "storyText", "pageContent", "panelCount", "suggestedReferences", "narrativePlane".
+{_WAN_MOTION_PROMPT_RULES}
+
+Return ONLY a JSON array of objects with the keys (EVERY object MUST contain ALL 10 keys, including a non-empty `motionPrompt` string — see rule 9 above):
+"pageNumber", "storySegment", "startAnchor", "endAnchor", "storyText", "pageContent", "panelCount", "suggestedReferences", "narrativePlane", "motionPrompt".
 """
     else:
         prompt = f"""
@@ -2895,7 +3012,7 @@ def generate_scene_image(
             )
         else:
             plane_note = (
-                "\n\nNARRATIVE PLANE: PRESENT REALITY — Sharp, solid environment; match the brief’s locked location, "
+                "\n\nNARRATIVE PLANE: PRESENT REALITY — Sharp, solid environment; match the brief's locked location, "
                 "time/lighting, and character wardrobe for this ongoing real-time thread. No dreamy flashback filter."
             )
 
@@ -2905,13 +3022,16 @@ def generate_scene_image(
         outline_note = (
             f"\n\nOUTLINE SECTION #{scene.outline_section_number}"
             + (f" ({osumm})" if osumm else "")
-            + ": trong cùng section, các beat hiện thực (present) dùng chung baseline bối cảnh + trang phục trong brief; "
-            "chỉ beat flashback được lệch hình."
+            + ": within the same section, all PRESENT-reality beats share the same baseline setting + wardrobe "
+            "from the brief; only FLASHBACK beats may use a different visual register."
         )
 
     bible_note = ""
     if app_mode == "review" and section_design and (getattr(scene, "narrative_plane", None) or "present").strip().lower() == "present":
-        bible_text = _format_wardrobe_bible_for_prompt(section_design)
+        bible_text = _format_wardrobe_bible_for_beat(
+            section_design,
+            list(getattr(scene, "suggested_references", []) or []),
+        )
         if bible_text:
             bible_note = (
                 "\n\nSECTION WARDROBE BIBLE (HIGHEST PRIORITY for this present-reality beat — render outfit, hair, accessories EXACTLY as specified; "
@@ -2925,7 +3045,9 @@ def generate_scene_image(
         f"{outline_note}"
         f"{bible_note}"
         f"\n\nStory summary (this segment): {scene.story_segment}\n"
-        f"Full story for tone reference:\n{story_context[:8000]}"
+        f"Narrative window (±2 beats around this beat — context only for tone/continuity; "
+        f"the line marked with → is THIS beat. DO NOT render any of these words as text on the image):\n"
+        f"{story_context[:2000]}"
     )
     parts: list[types.Part] = [
         types.Part.from_text(text=text_a),
@@ -3443,10 +3565,16 @@ def auto_build_character_refs(
     refine_characters: bool = True,
     generate_portraits: bool = True,
     resume: bool = False,
+    regenerate: bool = False,
 ) -> tuple[dict[str, Path], list[dict]]:
     """
     Trích nhân vật + (tuỳ chọn) sinh ảnh reference trong out_dir/auto_refs/.
-    Trả về (char_paths, danh sách nhân vật cuối cùng — sau refine nếu bật).
+
+    Caching: nếu out_dir/auto_refs/characters_extracted.json đã tồn tại và có ≥1 nhân vật hợp lệ,
+    BỎ QUA hai lần gọi LLM (pass 1 extract + pass 2 refine) và dùng nguyên danh sách cũ. Đặt
+    `regenerate=True` (hoặc CLI `--regenerate-characters`) để ép trích lại.
+
+    Trả về (char_paths, danh sách nhân vật cuối cùng).
     """
     ref_dir = out_dir / "auto_refs"
     ref_dir.mkdir(parents=True, exist_ok=True)
@@ -3473,51 +3601,78 @@ def auto_build_character_refs(
                     file=sys.stderr,
                 )
 
-    rows = extract_characters_from_story(
-        client,
-        story,
-        planner_model=planner_model,
-        max_characters=max_characters,
-    )
-    (ref_dir / "characters_draft.json").write_text(
-        json.dumps(rows, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    # CACHE HIT: characters_extracted.json đã có ≥1 nhân vật hợp lệ → bỏ hẳn 2 lần gọi LLM
+    # (extract pass 1 + refine pass 2). Tiết kiệm thời gian/chi phí khi rerun pipeline.
+    # Ép trích lại bằng `regenerate=True` (CLI: --regenerate-characters).
+    def _row_is_valid(r: dict) -> bool:
+        name = _row_character_name(r) or ""
+        return bool(name.strip())
 
-    if refine_characters and rows:
-        try:
-            rows = refine_character_list(
-                client,
-                story,
-                rows,
-                planner_model=planner_model,
-                max_characters=max_characters,
-            )
+    valid_existing = [r for r in existing_rows if _row_is_valid(r)]
+    if valid_existing and not regenerate:
+        print(
+            f"Đã có {existing_manifest} với {len(valid_existing)} nhân vật → "
+            "BỎ QUA pass 1 (extract) + pass 2 (refine). "
+            "Dùng --regenerate-characters để ép trích lại.",
+            file=sys.stderr,
+        )
+        # Ghi lại file (đã dedup) cho nhất quán.
+        existing_manifest.write_text(
+            json.dumps(valid_existing, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        rows = valid_existing
+    else:
+        if regenerate and existing_rows:
             print(
-                "Đã chạy pass 2 (refine): đối chiếu truyện, gộp trùng, làm sạch mô tả.",
+                "--regenerate-characters: ép trích lại từ truyện dù characters_extracted.json đã có.",
                 file=sys.stderr,
             )
-        except Exception as exc:
-            print(
-                f"Cảnh báo: refine nhân vật thất bại ({exc}); dùng kết quả pass 1.",
-                file=sys.stderr,
-            )
+        rows = extract_characters_from_story(
+            client,
+            story,
+            planner_model=planner_model,
+            max_characters=max_characters,
+        )
+        (ref_dir / "characters_draft.json").write_text(
+            json.dumps(rows, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    rows = _merge_character_rows(rows)
+        if refine_characters and rows:
+            try:
+                rows = refine_character_list(
+                    client,
+                    story,
+                    rows,
+                    planner_model=planner_model,
+                    max_characters=max_characters,
+                )
+                print(
+                    "Đã chạy pass 2 (refine): đối chiếu truyện, gộp trùng, làm sạch mô tả.",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(
+                    f"Cảnh báo: refine nhân vật thất bại ({exc}); dùng kết quả pass 1.",
+                    file=sys.stderr,
+                )
 
-    if existing_rows:
-        # Gộp existing + new theo fingerprint (canonicalName + aliases): nếu LLM lần này trả tên
-        # khác (vd. "Cố phu nhân" lần trước, "Phu nhân" lần này) nhưng có alias chung →
-        # KHÔNG tạo entry mới, mà bổ sung alias còn thiếu vào entry cũ.
-        n_old = len(existing_rows)
-        merged_all = _merge_character_rows(existing_rows + rows)
-        n_added = len(merged_all) - n_old
-        if n_added > 0:
-            print(
-                f"Tự động bổ sung {n_added} nhân vật mới vào characters_extracted.json (giữ nguyên danh sách cũ).",
-                file=sys.stderr,
-            )
-        rows = merged_all
+        rows = _merge_character_rows(rows)
+
+        if existing_rows:
+            # Gộp existing + new theo fingerprint (canonicalName + aliases): nếu LLM lần này trả tên
+            # khác (vd. "Cố phu nhân" lần trước, "Phu nhân" lần này) nhưng có alias chung →
+            # KHÔNG tạo entry mới, mà bổ sung alias còn thiếu vào entry cũ.
+            n_old = len(existing_rows)
+            merged_all = _merge_character_rows(existing_rows + rows)
+            n_added = len(merged_all) - n_old
+            if n_added > 0:
+                print(
+                    f"Tự động bổ sung {n_added} nhân vật mới vào characters_extracted.json (giữ nguyên danh sách cũ).",
+                    file=sys.stderr,
+                )
+            rows = merged_all
 
     char_paths: dict[str, Path] = {}
     if not generate_portraits:
@@ -3867,6 +4022,105 @@ def _warn_section_design_wardrobe_gaps(
                 "Sửa tay trong checkpoints/section_designs.json hoặc chạy --regenerate-section-designs.",
                 file=sys.stderr,
             )
+
+
+def _bible_keys_for_cast(
+    design: dict[str, Any] | None,
+    cast_filenames: list[str],
+) -> set[str]:
+    """
+    Map suggestedReferences (filenames như "06_Đại_tướng_quân.png") sang bible character keys
+    (canonical names như "Đại tướng quân") qua `_CHARACTER_ALIASES_MAP` + fingerprint.
+
+    Trả về set các bible keys khớp được. Set rỗng = không khớp được (caller sẽ fallback).
+    """
+    if not design or not isinstance(design, dict):
+        return set()
+    chars = design.get("characters") or {}
+    if not isinstance(chars, dict) or not chars:
+        return set()
+    bible_keys = list(chars.keys())
+    bible_fps: dict[str, str] = {}
+    for k in bible_keys:
+        fp = _alias_fingerprint(k)
+        if fp:
+            bible_fps[k] = fp
+
+    matched: set[str] = set()
+    for fn in cast_filenames or []:
+        if not fn:
+            continue
+        aliases: list[str] = []
+        seen: set[str] = set()
+        for a in _aliases_for_ref_filename(fn):
+            if isinstance(a, str) and a.strip():
+                key = a.strip().casefold()
+                if key not in seen:
+                    seen.add(key)
+                    aliases.append(a.strip())
+        label = _label_from_ref_filename(fn)
+        if label and label.casefold() not in seen:
+            aliases.append(label)
+
+        found = False
+        for a in aliases:
+            for k in bible_keys:
+                if k.casefold() == a.casefold():
+                    matched.add(k)
+                    found = True
+                    break
+            if found:
+                break
+        if found:
+            continue
+        for a in aliases:
+            fp = _alias_fingerprint(a)
+            if not fp:
+                continue
+            for k, kfp in bible_fps.items():
+                if kfp == fp:
+                    matched.add(k)
+                    found = True
+                    break
+            if found:
+                break
+    return matched
+
+
+def _format_wardrobe_bible_for_beat(
+    design: dict[str, Any] | None,
+    cast_filenames: list[str],
+) -> str:
+    """
+    Wardrobe bible cho 1 beat: giữ nguyên setting + lọc characters theo cast của beat.
+
+    Fallback giữ full bible khi không an toàn để lọc:
+      • design rỗng / không có setting hoặc characters,
+      • cast rỗng,
+      • section roster ≤ 2 (lọc không tiết kiệm gì),
+      • mapping suggestedReferences → bible keys quá nghèo (matched < cast - 1).
+    """
+    if not design or not isinstance(design, dict):
+        return ""
+    full_text = _format_wardrobe_bible_for_prompt(design)
+    chars = design.get("characters") or {}
+    if not isinstance(chars, dict) or not chars:
+        return full_text
+    cast_real = [fn for fn in (cast_filenames or []) if fn]
+    if not cast_real:
+        return full_text
+    if len(chars) <= 2:
+        return full_text
+    matched = _bible_keys_for_cast(design, cast_real)
+    if not matched:
+        return full_text
+    if len(matched) < max(1, len(cast_real) - 1):
+        return full_text
+    filtered_design = {
+        "setting": design.get("setting") or {},
+        "characters": {k: chars[k] for k in chars if k in matched},
+    }
+    return _format_wardrobe_bible_for_prompt(filtered_design)
 
 
 def _format_wardrobe_bible_for_prompt(design: dict[str, Any] | None) -> str:
@@ -4775,6 +5029,626 @@ def _render_section_keyframes(
     return paths, char_paths_by_section
 
 
+def _compact_neighbor_for_split_context(row: dict[str, Any]) -> dict[str, Any]:
+    story_text = (row.get("storyText") or "").strip()
+    return {
+        "pageNumber": row.get("pageNumber"),
+        "narrativePlane": row.get("narrativePlane") or "present",
+        "storySegment": (row.get("storySegment") or "").strip(),
+        "storyText": story_text[:220],
+        "pageContent": (row.get("pageContent") or "").strip()[:320],
+    }
+
+
+def _renumber_review_manifest_rows(rows: list[dict[str, Any]]) -> None:
+    for i, row in enumerate(rows, start=1):
+        if isinstance(row, dict):
+            row["pageNumber"] = i
+
+
+def _persist_review_manifest_rows(
+    *,
+    rows: list[dict[str, Any]],
+    checkpoint_path: Path,
+    manifest_path: Path | None = None,
+) -> None:
+    if checkpoint_path.is_file():
+        try:
+            ck = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            ck = None
+        if isinstance(ck, dict):
+            ck["scenes"] = rows
+            _atomic_write_json(checkpoint_path, ck)
+    if manifest_path is not None:
+        _atomic_write_json(manifest_path, rows)
+
+
+def _merge_split_beat_row(template: dict[str, Any], piece: dict[str, Any]) -> dict[str, Any]:
+    refs = piece.get("suggestedReferences")
+    if not isinstance(refs, list) or not refs:
+        refs = template.get("suggestedReferences") or []
+    row: dict[str, Any] = {
+        "mode": template.get("mode", "review"),
+        "storySegment": str(piece.get("storySegment") or template.get("storySegment") or "").strip(),
+        "startAnchor": str(piece.get("startAnchor") or "").strip(),
+        "endAnchor": str(piece.get("endAnchor") or "").strip(),
+        "storyText": str(piece.get("storyText") or "").strip(),
+        "pageContent": str(piece.get("pageContent") or "").strip(),
+        "panelCount": 1,
+        "suggestedReferences": list(refs),
+        "narrativePlane": _parse_narrative_plane(piece)
+        if piece.get("narrativePlane") is not None
+        else _parse_narrative_plane(template),
+    }
+    if template.get("outlineSectionNumber") is not None:
+        row["outlineSectionNumber"] = template.get("outlineSectionNumber")
+    summ = (template.get("outlineSectionSummary") or "").strip()
+    if summ:
+        row["outlineSectionSummary"] = summ
+    return row
+
+
+def _split_long_review_beat_with_llm(
+    *,
+    client: Any,
+    planner_model: str,
+    target_row: dict[str, Any],
+    neighbors_before: list[dict[str, Any]],
+    neighbors_after: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    target_compact = {
+        "pageNumber": target_row.get("pageNumber"),
+        "narrativePlane": target_row.get("narrativePlane") or "present",
+        "outlineSectionNumber": target_row.get("outlineSectionNumber"),
+        "outlineSectionSummary": (target_row.get("outlineSectionSummary") or "").strip(),
+        "storySegment": (target_row.get("storySegment") or "").strip(),
+        "startAnchor": (target_row.get("startAnchor") or "").strip(),
+        "endAnchor": (target_row.get("endAnchor") or "").strip(),
+        "storyText": (target_row.get("storyText") or "").strip(),
+        "pageContent": (target_row.get("pageContent") or "").strip(),
+        "suggestedReferences": target_row.get("suggestedReferences") or [],
+    }
+    prompt = f"""\
+You are re-splitting ONE overly long review illustration beat into 2–4 SHORTER beats.
+
+GOAL:
+- The TARGET beat's storyText is too long for one still image + one TTS clip.
+- Split by VISUAL RHYTHM: each output beat = ONE drawable frozen moment (one still + one motion clip).
+- Keep anchors/storyText VERBATIM from the TARGET beat's storyText only (source language unchanged).
+- Do NOT borrow or duplicate text from neighbor beats.
+
+{_VISUAL_RHYTHM_SPLIT_RULES}
+
+DURATION (each output beat):
+- Target 3–5 seconds of narration; never exceed ~8 seconds.
+- Vietnamese: ~8–10 syllables / 3s, ~12–15 / 5s, ~20–24 / 8s (ABSOLUTE CEILING).
+
+NEIGHBORS BEFORE (read-only context — up to 2 beats; DO NOT copy their text into output):
+{json.dumps(neighbors_before, ensure_ascii=False, indent=2)}
+
+TARGET BEAT (split THIS beat only):
+{json.dumps(target_compact, ensure_ascii=False, indent=2)}
+
+NEIGHBORS AFTER (read-only context — up to 2 beats; DO NOT copy their text into output):
+{json.dumps(neighbors_after, ensure_ascii=False, indent=2)}
+
+Task:
+- Replace the TARGET beat with 2–4 beats in narrative order.
+- Concatenated storyText of all output beats MUST cover the TARGET storyText exactly once, in order, with NO gaps and NO duplicated clauses.
+- startAnchor/endAnchor for each output beat MUST be exact substrings of the TARGET storyText.
+- pageContent: ENGLISH visual brief for THAT slice only; vary shot/staging across the split when the visual beat changes.
+- suggestedReferences: usually same as TARGET unless a slice clearly drops a co-present character.
+- narrativePlane: usually same as TARGET unless a slice is clearly a different memory register.
+
+Return ONLY a JSON array (2–4 objects). Each object MUST have EXACTLY these keys:
+"storySegment", "startAnchor", "endAnchor", "storyText", "pageContent", "panelCount", "suggestedReferences", "narrativePlane".
+Do NOT include pageNumber or motionPrompt.
+"""
+    def _call_split() -> Any:
+        return client.models.generate_content(
+            model=planner_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.35,
+                response_mime_type="application/json",
+            ),
+        )
+
+    resp = _generate_with_transient_retry(
+        _call_split,
+        label=f"split long beat pageNumber={target_row.get('pageNumber')}",
+    )
+    if resp is None:
+        return []
+    try:
+        parsed = _parse_planner_json_array(resp.text or "", client, planner_model)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(parsed, list) or len(parsed) < 2:
+        return []
+    out: list[dict[str, Any]] = []
+    for piece in parsed:
+        if not isinstance(piece, dict):
+            continue
+        merged = _merge_split_beat_row(target_row, piece)
+        if not (merged.get("storyText") or "").strip() or not (merged.get("pageContent") or "").strip():
+            continue
+        out.append(merged)
+    return out if len(out) >= 2 else []
+
+
+def split_long_review_beats_in_checkpoint(
+    *,
+    client: Any,
+    checkpoint_path: Path,
+    manifest_path: Path,
+    planner_model: str,
+    tts_sec_threshold: float = _LONG_BEAT_AUTO_SPLIT_SEC,
+) -> int:
+    """
+    Tự động tách các beat review có storyText dài hơn `tts_sec_threshold` (mặc định 10s),
+    dùng ngữ cảnh ±2 beat lân cận, đánh số lại pageNumber, ghi checkpoint + scenes.json,
+    rồi backfill motionPrompt cho beat mới/thiếu.
+
+    Trả về số beat gốc đã được tách thành công.
+    """
+    if not checkpoint_path.is_file():
+        return 0
+    try:
+        ck = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return 0
+    if not isinstance(ck, dict):
+        return 0
+    raw_rows = ck.get("scenes")
+    if not isinstance(raw_rows, list) or not raw_rows:
+        return 0
+
+    rows: list[dict[str, Any]] = [r for r in raw_rows if isinstance(r, dict)]
+    if not rows:
+        return 0
+
+    rows.sort(key=lambda r: int(r.get("pageNumber") or 0))
+    syll_threshold = _long_beat_syllable_threshold(tts_sec_threshold)
+    n_split_sources = 0
+    idx = 0
+    split_attempts_at_idx = 0
+    while idx < len(rows):
+        row = rows[idx]
+        story_text = (row.get("storyText") or "").strip()
+        if not story_text:
+            idx += 1
+            split_attempts_at_idx = 0
+            continue
+        if _count_tts_syllables(story_text) <= syll_threshold:
+            idx += 1
+            split_attempts_at_idx = 0
+            continue
+        if split_attempts_at_idx >= 3:
+            print(
+                f"  [WARN] beat {row.get('pageNumber')}: vẫn dài sau 3 lần tách; bỏ qua.",
+                file=sys.stderr,
+            )
+            idx += 1
+            split_attempts_at_idx = 0
+            continue
+
+        pn = row.get("pageNumber")
+        approx_s = _tts_seconds_for_text(story_text)
+        print(
+            f"Auto-split beat {pn}: ~{approx_s:.1f}s TTS (> {tts_sec_threshold:.0f}s) — "
+            f"tách theo nhịp hình ảnh (context ±2 beat)...",
+            file=sys.stderr,
+        )
+        neighbors_before = [
+            _compact_neighbor_for_split_context(rows[j])
+            for j in range(max(0, idx - 2), idx)
+        ]
+        neighbors_after = [
+            _compact_neighbor_for_split_context(rows[j])
+            for j in range(idx + 1, min(len(rows), idx + 3))
+        ]
+        new_rows = _split_long_review_beat_with_llm(
+            client=client,
+            planner_model=planner_model,
+            target_row=row,
+            neighbors_before=neighbors_before,
+            neighbors_after=neighbors_after,
+        )
+        if len(new_rows) < 2:
+            print(
+                f"  [WARN] beat {pn}: planner không trả split hợp lệ; giữ nguyên.",
+                file=sys.stderr,
+            )
+            idx += 1
+            split_attempts_at_idx = 0
+            continue
+
+        insert_at = idx
+        rows[insert_at : insert_at + 1] = new_rows
+        n_split_sources += 1
+        split_attempts_at_idx += 1
+        _renumber_review_manifest_rows(rows)
+        scene_objs = [_manifest_dict_to_scene(r) for r in rows]
+        _dedupe_review_story_text_overlaps(scene_objs)
+        rows = [scene_to_manifest_dict(s, "review") for s in scene_objs]
+        _persist_review_manifest_rows(
+            rows=rows,
+            checkpoint_path=checkpoint_path,
+            manifest_path=manifest_path,
+        )
+        print(
+            f"  ✓ beat {pn} → {len(new_rows)} beat (tổng {len(rows)}); đã lưu checkpoint + scenes.json.",
+            file=sys.stderr,
+        )
+        still_long_at: int | None = None
+        for j in range(insert_at, insert_at + len(new_rows)):
+            if _count_tts_syllables((rows[j].get("storyText") or "").strip()) > syll_threshold:
+                still_long_at = j
+                break
+        if still_long_at is None:
+            idx = insert_at + len(new_rows)
+            split_attempts_at_idx = 0
+        else:
+            idx = still_long_at
+
+    if n_split_sources > 0:
+        backfill_motion_prompts_in_scenes_json(
+            client=client,
+            scenes_path=manifest_path,
+            planner_model=planner_model,
+            batch_size=10,
+            force=False,
+            review_checkpoint_path=checkpoint_path,
+        )
+    return n_split_sources
+
+
+def _sync_motion_prompts_to_review_checkpoint(
+    *, scenes_path: Path, checkpoint_path: Path
+) -> int:
+    """
+    Sau khi backfill `motionPrompt` vào scenes.json, sync field này vào field `scenes` của
+    checkpoint `review_two_pass.json` để lần resume kế tiếp:
+      • planner load lại scenes từ checkpoint vẫn có motionPrompt sẵn,
+      • _persist khi ghi đè scenes.json không làm mất motionPrompt,
+      • auto-backfill ở cuối main() thấy 0 beat thiếu → skip (không chạy lại vô ích).
+
+    Trả về số entry trong checkpoint đã được cập nhật. Bỏ qua mọi lỗi nhẹ (best-effort).
+    """
+    if not checkpoint_path.is_file():
+        return 0
+    try:
+        scenes_rows = json.loads(scenes_path.read_text(encoding="utf-8"))
+        ck = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return 0
+    if not isinstance(scenes_rows, list) or not isinstance(ck, dict):
+        return 0
+    ck_scenes = ck.get("scenes")
+    if not isinstance(ck_scenes, list):
+        return 0
+
+    pn_to_mp: dict[int, str] = {}
+    for r in scenes_rows:
+        if not isinstance(r, dict):
+            continue
+        pn = r.get("pageNumber")
+        mp = (r.get("motionPrompt") or "").strip()
+        if pn is None or not mp:
+            continue
+        try:
+            pn_to_mp[int(pn)] = mp
+        except (TypeError, ValueError):
+            continue
+
+    n_updated = 0
+    for r in ck_scenes:
+        if not isinstance(r, dict):
+            continue
+        pn = r.get("pageNumber")
+        if pn is None:
+            continue
+        try:
+            key = int(pn)
+        except (TypeError, ValueError):
+            continue
+        new_mp = pn_to_mp.get(key, "")
+        old_mp = (r.get("motionPrompt") or "").strip()
+        if new_mp and new_mp != old_mp:
+            r["motionPrompt"] = new_mp
+            n_updated += 1
+
+    if n_updated > 0:
+        try:
+            _atomic_write_json(checkpoint_path, ck)
+            print(
+                f"  [sync] đồng bộ {n_updated} motionPrompt vào checkpoint "
+                f"{checkpoint_path.name} → lần resume kế tiếp sẽ giữ nguyên.",
+                file=sys.stderr,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  [WARN] sync checkpoint thất bại ({exc}); scenes.json đã ok, bỏ qua.",
+                file=sys.stderr,
+            )
+            return 0
+    return n_updated
+
+
+def backfill_motion_prompts_in_scenes_json(
+    *,
+    client: Any,
+    scenes_path: Path,
+    planner_model: str,
+    batch_size: int = 10,
+    force: bool = False,
+    review_checkpoint_path: Path | None = None,
+) -> int:
+    """
+    Đọc scenes.json sẵn có, với mỗi beat thiếu/empty `motionPrompt` gọi planner sinh prompt
+    WAN 2.1 I2V theo `_WAN_MOTION_PROMPT_RULES`, rồi ghi đè ngược lại scenes.json.
+
+    Dùng khi planner chạy trước đó (Gemini 2.5-flash) đã bỏ field `motionPrompt`, để khỏi
+    phải re-run toàn bộ planner / re-generate ảnh.
+
+    Khi `review_checkpoint_path` được cung cấp (vd. out_dir/checkpoints/review_two_pass.json):
+    sau mỗi batch lưu xong cũng sync motionPrompt vào checkpoint, để lần planner-resume kế tiếp
+    không bị mất kết quả backfill.
+
+    Trả về số beat đã backfill thành công.
+    """
+    raw_text = scenes_path.read_text(encoding="utf-8")
+    rows = json.loads(raw_text)
+    if not isinstance(rows, list):
+        raise SystemExit(f"scenes.json phải là JSON array: {scenes_path}")
+
+    targets: list[tuple[int, dict[str, Any]]] = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        existing = (row.get("motionPrompt") or "").strip()
+        if force or not existing:
+            targets.append((idx, row))
+
+    if not targets:
+        print(
+            f"motionPrompt đã đủ cho toàn bộ {len(rows)} beat trong {scenes_path}. "
+            "Không cần backfill.",
+            file=sys.stderr,
+        )
+        return 0
+
+    n_already = len(rows) - len(targets)
+    n_total_batches = (len(targets) + batch_size - 1) // batch_size
+    resume_note = (
+        f" (skip {n_already} beat đã có motionPrompt → resume)" if n_already > 0 and not force else ""
+    )
+    print(
+        f"Backfill motionPrompt: {len(targets)}/{len(rows)} beat cần điền"
+        f"{resume_note}; batch={batch_size}, n_batches={n_total_batches}, model={planner_model}.",
+        file=sys.stderr,
+    )
+
+    def _neighbor_summary(idx: int) -> dict[str, Any] | None:
+        """Compact context row cho adjacency awareness — KHÔNG yêu cầu motionPrompt."""
+        if idx < 0 or idx >= len(rows):
+            return None
+        nb = rows[idx]
+        if not isinstance(nb, dict):
+            return None
+        story_text_raw = (nb.get("storyText", "") or "").strip()
+        return {
+            "pageNumber": nb.get("pageNumber"),
+            "narrativePlane": nb.get("narrativePlane") or "present",
+            "storyText": story_text_raw[:200],  # truncate dài để tiết kiệm token
+        }
+
+    n_filled = 0
+    for batch_idx, start in enumerate(range(0, len(targets), batch_size), start=1):
+        chunk = targets[start : start + batch_size]
+        batch_row_indices = {idx for idx, _ in chunk}
+
+        # (B) outlineSectionSummary đưa vào mỗi target để model có tonal context cho cả section.
+        target_items: list[dict[str, Any]] = []
+        for _, row in chunk:
+            target_items.append(
+                {
+                    "pageNumber": row.get("pageNumber"),
+                    "outlineSectionNumber": row.get("outlineSectionNumber"),
+                    "outlineSectionSummary": (row.get("outlineSectionSummary", "") or "").strip(),
+                    "narrativePlane": row.get("narrativePlane") or "present",
+                    "storyText": row.get("storyText", "") or "",
+                    "pageContent": row.get("pageContent", "") or "",
+                    "suggestedReferences": row.get("suggestedReferences", []) or [],
+                }
+            )
+
+        # (A) Neighbor window ±2: với mỗi target lấy 2 beat trước (-1, -2) + 2 beat sau (+1, +2)
+        # nếu CHƯA nằm trong batch. Chỉ giữ pageNumber + narrativePlane + storyText (truncated)
+        # — KHÔNG yêu cầu motionPrompt. Phục hồi adjacency awareness rộng hơn ở biên batch
+        # (tonal continuity giữa các beat liền kề + nhịp 2-beat liên hoàn).
+        neighbor_items: list[dict[str, Any]] = []
+        seen_neighbor_pages: set[Any] = set()
+        for tgt_idx, _ in chunk:
+            for n_idx in (tgt_idx - 2, tgt_idx - 1, tgt_idx + 1, tgt_idx + 2):
+                if n_idx in batch_row_indices:
+                    continue
+                summary = _neighbor_summary(n_idx)
+                if summary is None:
+                    continue
+                pn_key = summary.get("pageNumber")
+                if pn_key in seen_neighbor_pages:
+                    continue
+                seen_neighbor_pages.add(pn_key)
+                neighbor_items.append(summary)
+        # Sắp xếp theo pageNumber để LLM đọc tuần tự.
+        neighbor_items.sort(key=lambda x: x.get("pageNumber") if isinstance(x.get("pageNumber"), int) else 0)
+
+        if neighbor_items:
+            neighbor_block = (
+                "ADJACENT CONTEXT BEATS — up to 2 beats before and 2 beats after each target "
+                "(read-only — for tonal / adjacency awareness only; DO NOT generate motionPrompt "
+                "for these, they are NOT in the batch). Use them to understand the local motion arc "
+                "(decelerating → calm; building → climactic; calm → reaction) across a ~5-beat window:\n"
+                + json.dumps(neighbor_items, ensure_ascii=False, indent=2)
+                + "\n\n"
+            )
+        else:
+            neighbor_block = ""
+
+        prompt = f"""\
+You are filling in the MISSING field `motionPrompt` (WAN 2.1 image-to-video prompt) for a batch
+of already-planned story beats. Each beat already has a fixed `pageContent` (a static visual
+description of the still image) and `storyText` (the narration TTS). You only produce `motionPrompt`.
+
+Each batch item also carries `outlineSectionSummary` — the section-level tonal arc the beat belongs
+to. Use it to keep motion intensity / mood consistent with the section's emotional register
+(e.g. climactic section → stronger kinetic verbs; reflective section → quieter body anchors).
+
+{_WAN_MOTION_PROMPT_RULES}
+
+{neighbor_block}BATCH BEATS (generate motionPrompt for EACH of these — read all fields for context, especially pageContent + narrativePlane + outlineSectionSummary):
+{json.dumps(target_items, ensure_ascii=False, indent=2)}
+
+Task: For EACH batch beat (NOT for neighbor context beats), produce ONE WAN 2.1 motion prompt that animates THAT beat's still image.
+Where adjacent context is provided (up to 2 beats before and 2 beats after the batch), make the motion of each batch beat fit naturally into the local 5-beat arc:
+  • Read the 2 preceding context beats (if any) to understand the kinetic state the character is COMING FROM (e.g. running → slowing; weeping → recovering; tense silence → breaking).
+  • Read the 2 following context beats (if any) to understand the kinetic state the character is HEADING INTO (e.g. about to stand up → end with weight shift; about to flinch → end with held breath).
+  • Match breath cadence, head orientation, hand position, and energy level so consecutive clips can be cut/lipsynced together without jarring discontinuity.
+
+Output MUST be a JSON array of the SAME length and SAME order as the BATCH BEATS array, where each object has EXACTLY two keys:
+  - "pageNumber" (int, matching the input pageNumber)
+  - "motionPrompt" (non-empty string, 60-110 words, following ALL rules above)
+
+Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys other than pageNumber + motionPrompt.
+"""
+        first_pn_for_log = target_items[0].get("pageNumber")
+
+        def _call_backfill() -> Any:
+            return client.models.generate_content(
+                model=planner_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.5,
+                    response_mime_type="application/json",
+                ),
+            )
+
+        try:
+            resp = _generate_with_transient_retry(
+                _call_backfill,
+                label=f"backfill motionPrompt batch {batch_idx}/{n_total_batches} (start pageNumber={first_pn_for_log})",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Non-transient (vd. quota / 400) → re-raise đã handle, ở đây bắt lỗi ngoài.
+            print(
+                f"  [WARN] batch bắt đầu pageNumber={first_pn_for_log} lỗi không-transient: {exc}; bỏ qua batch.",
+                file=sys.stderr,
+            )
+            continue
+        if resp is None:
+            # Đã retry hết delays nhưng vẫn fail transient → skip, beat trong batch sẽ được retry
+            # ở lần chạy resume kế tiếp (vẫn nằm trong targets vì chưa có motionPrompt).
+            print(
+                f"  [WARN] batch bắt đầu pageNumber={first_pn_for_log}: fail sau toàn bộ retry; "
+                "bỏ qua, lần resume kế tiếp sẽ thử lại tự động.",
+                file=sys.stderr,
+            )
+            continue
+
+        text = _strip_json_fence(getattr(resp, "text", None) or "")
+        try:
+            parsed = _json_loads_llm(text)
+        except Exception as exc:  # noqa: BLE001
+            first_pn = target_items[0].get("pageNumber")
+            print(
+                f"  [WARN] batch bắt đầu pageNumber={first_pn} không parse được JSON ({exc}); bỏ qua batch.",
+                file=sys.stderr,
+            )
+            continue
+
+        if not isinstance(parsed, list):
+            first_pn = target_items[0].get("pageNumber")
+            print(
+                f"  [WARN] batch bắt đầu pageNumber={first_pn}: planner trả không phải array; bỏ qua.",
+                file=sys.stderr,
+            )
+            continue
+
+        by_page: dict[int, str] = {}
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            pn_raw = item.get("pageNumber")
+            mp_raw = item.get("motionPrompt")
+            if pn_raw is None or not isinstance(mp_raw, str):
+                continue
+            try:
+                by_page[int(pn_raw)] = mp_raw.strip()
+            except (TypeError, ValueError):
+                continue
+
+        batch_filled = 0
+        for _, row in chunk:
+            pn_val = row.get("pageNumber")
+            try:
+                key = int(pn_val) if pn_val is not None else None
+            except (TypeError, ValueError):
+                key = None
+            mp = by_page.get(key, "") if key is not None else ""
+            if mp:
+                row["motionPrompt"] = mp
+                n_filled += 1
+                batch_filled += 1
+                preview = re.sub(r"\s+", " ", mp)[:90]
+                print(f"  ✓ beat {pn_val}: {preview}…", file=sys.stderr)
+            else:
+                print(
+                    f"  [WARN] beat {pn_val}: planner không trả motionPrompt; giữ nguyên (sẽ thử lại ở lần sau).",
+                    file=sys.stderr,
+                )
+
+        # Persist sau MỖI batch để khỏi mất tiến độ nếu crash. Resume tự nhiên: lần chạy tiếp
+        # theo sẽ thấy beat đã có motionPrompt → skip (logic ở đầu hàm). Chỉ ghi khi batch có
+        # thay đổi thực để giảm I/O.
+        if batch_filled > 0:
+            try:
+                _atomic_write_json(scenes_path, rows)
+                print(
+                    f"  [checkpoint] batch {batch_idx}/{n_total_batches}: lưu {n_filled}/{len(targets)} "
+                    f"motionPrompt vào {scenes_path.name} (resume-safe).",
+                    file=sys.stderr,
+                )
+                # Sync ngược vào review_two_pass.json để lần planner-resume sau không xoá mất.
+                if review_checkpoint_path is not None:
+                    _sync_motion_prompts_to_review_checkpoint(
+                        scenes_path=scenes_path,
+                        checkpoint_path=review_checkpoint_path,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"  [WARN] batch {batch_idx}/{n_total_batches}: lưu checkpoint thất bại ({exc}); "
+                    "tiến độ trong memory chưa bị mất, vẫn tiếp tục.",
+                    file=sys.stderr,
+                )
+
+    # Cuối cùng: đảm bảo file đã sync (nếu batch cuối không có thay đổi vẫn cần flush một lần).
+    _atomic_write_json(scenes_path, rows)
+    # Final sync vào checkpoint (no-op nếu đã sync đủ ở các batch trước).
+    if review_checkpoint_path is not None:
+        _sync_motion_prompts_to_review_checkpoint(
+            scenes_path=scenes_path,
+            checkpoint_path=review_checkpoint_path,
+        )
+    print(
+        f"Hoàn tất: ghi {n_filled}/{len(targets)} motionPrompt mới vào {scenes_path}.",
+        file=sys.stderr,
+    )
+    return n_filled
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tách truyện thành cảnh + sinh ảnh (Gemini), consistency nhân vật qua reference."
@@ -4933,6 +5807,15 @@ def main() -> None:
         help="Với --auto-characters: bỏ pass 2 refine (tiết kiệm 1 lần gọi text API; độ chính xác thường giảm).",
     )
     parser.add_argument(
+        "--regenerate-characters",
+        action="store_true",
+        help=(
+            "Với --auto-characters: ÉP trích lại nhân vật từ truyện kể cả khi "
+            "<output>/auto_refs/characters_extracted.json đã có. Mặc định: nếu file đã có ≥1 nhân vật "
+            "hợp lệ thì bỏ hẳn pass 1 (extract) + pass 2 (refine) để tiết kiệm thời gian/chi phí."
+        ),
+    )
+    parser.add_argument(
         "--char",
         action="append",
         default=[],
@@ -5004,6 +5887,59 @@ def main() -> None:
         default="portrait",
     )
     parser.add_argument(
+        "--backfill-motion-prompts",
+        action="store_true",
+        help=(
+            "Đọc <output>/scenes.json đã có, với mỗi beat thiếu/empty motionPrompt thì gọi planner "
+            "sinh prompt WAN 2.1 I2V rồi ghi đè scenes.json. Không cần --story. "
+            "Dùng khi planner trước đó (Gemini 2.5-flash) bỏ qua field motionPrompt, để khỏi re-run "
+            "toàn bộ planner / render lại ảnh."
+        ),
+    )
+    parser.add_argument(
+        "--force-backfill-motion-prompts",
+        action="store_true",
+        help="Đi kèm --backfill-motion-prompts: ép overwrite cả những beat đã có motionPrompt.",
+    )
+    parser.add_argument(
+        "--backfill-batch-size",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Số beat / batch khi backfill motionPrompt (mặc định 10). Giảm nếu hay 429/timeout.",
+    )
+    parser.add_argument(
+        "--auto-split-long-beats",
+        dest="auto_split_long_beats",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Mode review + resume checkpoint: trước khi planner chạy tiếp, tự tìm beat có storyText "
+            "dài hơn --split-long-beat-sec, tách theo nhịp hình ảnh (context ±2 beat), đánh số lại "
+            "pageNumber, ghi checkpoint/scenes.json, rồi backfill motionPrompt. "
+            "Tắt bằng --no-auto-split-long-beats."
+        ),
+    )
+    parser.add_argument(
+        "--split-long-beat-sec",
+        type=float,
+        default=_LONG_BEAT_AUTO_SPLIT_SEC,
+        metavar="SECONDS",
+        help="Ngưỡng TTS (giây) để auto-split beat dài khi resume (mặc định 10).",
+    )
+    parser.add_argument(
+        "--auto-backfill-motion-prompts",
+        dest="auto_backfill_motion_prompts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Mode review: sau khi planner ghi scenes.json, nếu beat nào thiếu motionPrompt "
+            "thì TỰ động gọi backfill ngay (cùng cơ chế với --backfill-motion-prompts). "
+            "Mặc định BẬT vì Gemini 2.5-flash thường drop field này. "
+            "Tắt bằng --no-auto-backfill-motion-prompts."
+        ),
+    )
+    parser.add_argument(
         "--art-style",
         choices=(
             "watercolor",
@@ -5071,6 +6007,26 @@ def main() -> None:
         file=sys.stderr,
     )
 
+    # Backfill motionPrompt cho scenes.json đã có — chạy nhanh, không cần --story.
+    if getattr(args, "backfill_motion_prompts", False):
+        out_dir_bf = args.output.expanduser().resolve()
+        scenes_path_bf = out_dir_bf / "scenes.json"
+        if not scenes_path_bf.is_file():
+            parser.error(
+                f"--backfill-motion-prompts cần {scenes_path_bf} đã tồn tại. "
+                "Chạy planner trước, hoặc trỏ -o đúng thư mục output."
+            )
+        ck_for_bf = out_dir_bf / "checkpoints" / "review_two_pass.json"
+        backfill_motion_prompts_in_scenes_json(
+            client=client,
+            scenes_path=scenes_path_bf,
+            planner_model=args.planner_model,
+            batch_size=int(getattr(args, "backfill_batch_size", 10) or 10),
+            force=bool(getattr(args, "force_backfill_motion_prompts", False)),
+            review_checkpoint_path=ck_for_bf if ck_for_bf.is_file() else None,
+        )
+        return
+
     if args.story_stdin:
         story = sys.stdin.read()
     elif args.story:
@@ -5105,6 +6061,94 @@ def main() -> None:
                 f"Đã xóa dàn ý tạm: {review_outline_sidecar}",
                 file=sys.stderr,
             )
+
+    if (
+        args.mode == "review"
+        and args.review_two_pass
+        and bool(getattr(args, "auto_split_long_beats", True))
+        and review_ck.is_file()
+        and not args.fresh_checkpoint
+    ):
+        try:
+            n_split = split_long_review_beats_in_checkpoint(
+                client=client,
+                checkpoint_path=review_ck,
+                manifest_path=out_dir / "scenes.json",
+                planner_model=args.planner_model,
+                tts_sec_threshold=float(
+                    getattr(args, "split_long_beat_sec", _LONG_BEAT_AUTO_SPLIT_SEC)
+                ),
+            )
+            if n_split > 0:
+                print(
+                    f"Auto-split beat dài: đã tách {n_split} beat gốc (> "
+                    f"{float(getattr(args, 'split_long_beat_sec', _LONG_BEAT_AUTO_SPLIT_SEC)):.0f}s TTS).",
+                    file=sys.stderr,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  [WARN] auto-split beat dài thất bại ({exc}); planner vẫn tiếp tục.",
+                file=sys.stderr,
+            )
+
+    # Pre-resume backfill: nếu checkpoint review_two_pass đã có sẵn N beat (vd. đang dở 10/19 section),
+    # fill motionPrompt cho N beat đó NGAY trước khi planner chạy tiếp các section còn lại. Nếu lần
+    # planner kế tiếp crash, 399 beat đã có vẫn an toàn (motionPrompt đã lưu cả ở scenes.json lẫn
+    # checkpoint nhờ cơ chế sync). Cũng giảm gánh nặng cho auto-backfill cuối main(): chỉ phải xử lý
+    # số beat planner mới sinh, không phải toàn bộ truyện.
+    if (
+        args.mode == "review"
+        and args.review_two_pass
+        and bool(getattr(args, "auto_backfill_motion_prompts", True))
+        and review_ck.is_file()
+        and not args.fresh_checkpoint
+    ):
+        try:
+            _ck_raw = json.loads(review_ck.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _ck_raw = None
+        _ck_scenes = (
+            _ck_raw.get("scenes") if isinstance(_ck_raw, dict) else None
+        ) or []
+        if isinstance(_ck_scenes, list) and _ck_scenes:
+            _n_missing = sum(
+                1
+                for r in _ck_scenes
+                if isinstance(r, dict) and not (r.get("motionPrompt") or "").strip()
+            )
+            if _n_missing > 0:
+                print(
+                    f"Pre-resume backfill: checkpoint hiện có {len(_ck_scenes)} beat, "
+                    f"{_n_missing} thiếu motionPrompt. Fill ngay TRƯỚC khi planner chạy tiếp "
+                    "các section còn lại (an toàn nếu crash giữa chừng)...",
+                    file=sys.stderr,
+                )
+                _scenes_pre_path = out_dir / "scenes.json"
+                # Mirror checkpoint.scenes → scenes.json để backfill có file để đọc/ghi.
+                # Planner sẽ overwrite lại scenes.json sau mỗi section nhưng đã giữ motionPrompt
+                # nhờ _manifest_dict_to_scene → scene_to_manifest_dict bảo toàn field này.
+                try:
+                    _atomic_write_json(_scenes_pre_path, _ck_scenes)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"  [WARN] không ghi được {_scenes_pre_path} ({exc}); bỏ qua pre-resume backfill.",
+                        file=sys.stderr,
+                    )
+                else:
+                    try:
+                        backfill_motion_prompts_in_scenes_json(
+                            client=client,
+                            scenes_path=_scenes_pre_path,
+                            planner_model=args.planner_model,
+                            batch_size=int(getattr(args, "backfill_batch_size", 10) or 10),
+                            force=False,
+                            review_checkpoint_path=review_ck,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            f"  [WARN] pre-resume backfill thất bại ({exc}); planner vẫn tiếp tục bình thường.",
+                            file=sys.stderr,
+                        )
 
     manual_char_paths = _parse_char_args(args.char)
 
@@ -5144,6 +6188,7 @@ def main() -> None:
             refine_characters=not args.no_refine_characters,
             generate_portraits=gen_portraits,
             resume=args.resume,
+            regenerate=bool(getattr(args, "regenerate_characters", False)),
         )
         _configure_character_aliases(extracted_rows=_extracted_rows)
         if _CHARACTER_ALIASES_MAP:
@@ -5261,6 +6306,86 @@ def main() -> None:
             [scene_to_manifest_dict(s, render_mode) for s in scenes],
         )
         print(f"Đã ghi {manifest_path} ({len(scenes)} cảnh).", file=sys.stderr)
+
+    # Auto-backfill motionPrompt: Gemini 2.5-flash thường drop field này dù prompt đã ép.
+    # Chạy LUÔN cho mode review — kể cả khi resume từ --from-scenes (backfill chỉ THÊM motionPrompt
+    # cho beat đang rỗng, KHÔNG ghi đè field có sẵn nên an toàn). Tắt bằng --no-auto-backfill-motion-prompts.
+    # Target path:
+    #   - Mặc định: out_dir/scenes.json (planner vừa ghi).
+    #   - Với --from-scenes mà KHÔNG có --save-plan: out_dir/scenes.json chưa được ghi,
+    #     ta backfill thẳng vào file plan nguồn (args.from_scenes) — đây là file user đang đọc.
+    auto_bf_enabled = (
+        render_mode == "review"
+        and bool(getattr(args, "auto_backfill_motion_prompts", True))
+    )
+    if auto_bf_enabled:
+        if args.from_scenes and not args.save_plan:
+            bf_target_path = args.from_scenes.expanduser().resolve()
+            bf_target_label = f"file plan nguồn {bf_target_path}"
+        else:
+            bf_target_path = manifest_path
+            bf_target_label = str(manifest_path)
+
+        if not bf_target_path.is_file():
+            print(
+                f"Auto-backfill motionPrompt: bỏ qua — không tìm thấy {bf_target_path}.",
+                file=sys.stderr,
+            )
+        else:
+            n_missing = sum(
+                1 for s in scenes if not (getattr(s, "motion_prompt", "") or "").strip()
+            )
+            if n_missing > 0:
+                print(
+                    f"Auto-backfill motionPrompt: {n_missing}/{len(scenes)} beat thiếu — gọi backfill "
+                    f"ngay vào {bf_target_label} (tắt: --no-auto-backfill-motion-prompts).",
+                    file=sys.stderr,
+                )
+                try:
+                    backfill_motion_prompts_in_scenes_json(
+                        client=client,
+                        scenes_path=bf_target_path,
+                        planner_model=args.planner_model,
+                        batch_size=int(getattr(args, "backfill_batch_size", 10) or 10),
+                        force=False,
+                        review_checkpoint_path=(
+                            review_ck
+                            if (bf_target_path == manifest_path and review_ck.is_file())
+                            else None
+                        ),
+                    )
+                    # Cập nhật motion_prompt vào scenes in-memory (phòng bước sau cần dùng).
+                    try:
+                        reloaded = json.loads(bf_target_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        reloaded = None
+                    if isinstance(reloaded, list):
+                        pn_to_mp: dict[int, str] = {}
+                        for r in reloaded:
+                            if not isinstance(r, dict):
+                                continue
+                            pn = r.get("pageNumber")
+                            mp = (r.get("motionPrompt") or "").strip()
+                            if pn is None or not mp:
+                                continue
+                            try:
+                                pn_to_mp[int(pn)] = mp
+                            except (TypeError, ValueError):
+                                continue
+                        for s in scenes:
+                            if (getattr(s, "motion_prompt", "") or "").strip():
+                                continue
+                            try:
+                                v = pn_to_mp.get(int(s.page_number), "")
+                            except (TypeError, ValueError):
+                                v = ""
+                            if v:
+                                s.motion_prompt = v
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"Cảnh báo: auto-backfill motionPrompt thất bại ({exc}); tiếp tục.",
+                        file=sys.stderr,
+                    )
 
     if args.plan_only:
         # Khi đã yêu cầu --section-keyframe (cùng --section-image-continuity, mode review),
@@ -5406,7 +6531,7 @@ def main() -> None:
         if sec_char_map:
             section_char_ref_paths[sec_int] = sec_char_map
 
-    for scene in scenes:
+    for i, scene in enumerate(scenes):
         idx = scene.page_number
         label = (
             "trang"
@@ -5498,10 +6623,24 @@ def main() -> None:
         else:
             print(f"Đang render {label} {idx}...", file=sys.stderr)
         scene_section_design = section_designs.get(int(sec_n)) if (sec_n is not None and section_designs) else None
+
+        # Narrative window: ±2 beat lân cận thay cho việc nhồi cả truyện gốc.
+        _w_lo = max(0, i - 2)
+        _w_hi = min(len(scenes), i + 3)
+        _window_lines: list[str] = []
+        for j in range(_w_lo, _w_hi):
+            _stxt = (getattr(scenes[j], "story_text", "") or "").strip()
+            if not _stxt:
+                continue
+            _marker = "→" if j == i else " "
+            _pn = getattr(scenes[j], "page_number", j + 1)
+            _window_lines.append(f"{_marker} [#{_pn}] {_stxt}")
+        narrative_window = "\n".join(_window_lines)
+
         data, mime = generate_scene_image(
             client,
             scene,
-            story,
+            narrative_window,
             ref_paths=ref_for_scene,
             image_model=args.image_model,
             color_mode=args.color,
