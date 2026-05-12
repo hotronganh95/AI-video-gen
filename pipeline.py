@@ -386,6 +386,8 @@ _TTS_BEAT_MAX_SEC = 8.0
 _TTS_BEAT_TARGET_SYLL = int(_TTS_SYLL_PER_SEC * _TTS_BEAT_TARGET_SEC)  # 15
 _TTS_BEAT_MAX_SYLL = int(_TTS_SYLL_PER_SEC * _TTS_BEAT_MAX_SEC)  # 24
 _LONG_BEAT_AUTO_SPLIT_SEC = 10.0
+_MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS = 5
+_MOTION_BACKFILL_MAX_NEIGHBOR_RADIUS = 20
 
 
 def _tts_seconds_for_text(text: str) -> float:
@@ -451,43 +453,123 @@ _WAN_MOTION_PROMPT_RULES: str = """\
 9. motionPrompt — REQUIRED FIELD, MUST appear in EVERY beat object (never omit, never leave empty).
    This is a WAN 2.1 image-to-video (I2V) prompt that animates THIS beat's still image into a short clip
    (~3–5 seconds, matching the storyText TTS length). ALWAYS write in ENGLISH regardless of source language;
-   use ASCII apostrophes (not curly quotes). Length target: 60–110 words.
+   use ASCII apostrophes (not curly quotes). Length target: 70–120 words.
 
    WAN 2.1 I2V CONVENTIONS — STRICT (follow ALL):
    (a) Do NOT re-describe wardrobe / identity / setting / lighting / palette — the input still image already locks all of those. Describe ONLY what MOVES during the clip.
-   (b) Use ROLES, not source-language proper nouns: "the young woman", "the stern young prince", "the masked sister", "the elderly emperor", "the general", "the past princess", "the messenger", etc.
-   (c) FOCUS ON CHARACTER (subject) MOTION with CONCRETE kinetic verbs anchored to measurable body parts. Include at least 2 of:
-       • Body: "chest rises and falls with one slow breath", "shoulders rise then drop", "she takes one half-step forward", "his torso leans forward 5 degrees".
-       • Head: "chin tilts down 5 degrees", "head turns 10 degrees toward [role]", "single slow nod", "chin lifts a touch".
-       • Eyes: "blinks once slowly", "lashes lower then lift", "eyes flick to the right then back", "gaze locks toward [role]".
-       • Mouth: "lips part about half a centimetre and close again", "the corners of his mouth pull upward into a clear smirk". For DIALOGUE beats: "lips part and close in a clear speaking rhythm — short pauses every two beats".
-       • Hands: "right hand lifts and points sharply", "fingertips slowly curl tighter into sleeve fabric", "fingers wrap around the cup".
-   (d) Add ONE camera move (pick one only): "slow dolly-in", "slow lateral pan-right", "very slow micro push-in", "static eye-level hold", "slow drift across hand to face", "slow truck-left following her movement".
-   (e) Add ambient motion if appropriate: "dust motes drift in shafts of light", "loose hair strands flutter in the breeze", "distant banners ripple", "candle flames flicker", "embers and dust swirl past them".
-   (f) FORBIDDEN softeners (NEVER use any of these in motionPrompt) — WAN translates them as "frozen subject" and outputs only camera + ambient motion: "subtle", "barely", "imperceptible", "a fraction", "almost", "slight movement", "nearly motionless", "remains motionless", "stands still" (unless followed by an explicit body-anchor verb in the same sentence).
-   (g) ONE CONTINUOUS TAKE — WAN cannot cut, dissolve, or rack-focus across multiple subjects mid-clip. FORBIDDEN words/phrases in motionPrompt: "montage", "cross-dissolve", "cuts to", "rack focus", "split screen", "then we cut to". Pick ONE primary action chain in ONE place.
-   (h) DIALOGUE beats (a character speaks): WAN cannot lipsync from text alone. Describe lips/mouth motion in clear speaking rhythm with body anchors (head bobs, breath, hand gesture), then APPEND at the end of the prompt: "(lipsync polished in post)".
-   (i) FLASHBACK beats: briefly carry the memory-grade register from pageContent into the motion clip (e.g. "cool desaturated memory grade with slight grain", "soft sepia memory tone with subtle vignette"). One short clause is enough.
-   (j) ENV-ONLY beats (no characters in pageContent): describe ONLY environment motion (mist rolls slowly, dust drifts, banners ripple, candles flicker, particles swirl through cracks). Do NOT add the "Subject motion priority" suffix.
-   (k) END every CHARACTER beat with this exact cue line: "Subject motion priority over camera; characters move clearly, not frozen." Then add a duration + framerate tag: "5s, 24fps" (use "3s, 24fps" for very short story lines like a single word, or "6s, 24fps" for the rare beat near the 8s ceiling).
-   (l) NO source-language proper nouns inside motionPrompt. NO rendered text. NO captions / subtitles / speech bubbles / signs.
+   (b) SUBJECT LABELS — WAN I2V reads identity from the still image, NOT from story kinship or TTS.
+       Applies to ANY genre (literary, romance, thriller, mystery, sci-fi, fantasy, horror, historical,
+       slice-of-life, comedy, children's, nonfiction adaptation). Use short ENGLISH on-screen archetype
+       roles only. Derive labels from pageContent + WHO IS WHERE (SPEAKER / LISTENERS / who is in frame),
+       plus visible costume/posture when helpful — never copy a fixed genre template.
+       Pattern: the [visible figure] + optional [wardrobe cue from pageContent] (e.g. "the barista in
+       a green apron", "the detective in a trench coat", "the student in a school blazer", "the pilot
+       in a flight suit", "the nurse in scrubs", "the runner in a track jacket", "the host behind the
+       podium"). Pick labels from THIS still only — do not reuse a default costume template from another
+       genre or from the GOOD/BAD examples below.
+       FORBIDDEN as subject labels: kinship / relation words from storyText or narrator POV
+       (father, mother, sister, brother, daughter, son, wife, husband, uncle, aunt, elder sister,
+       younger sister, phu nhan, a ty, my father, her mother, etc.); source-language proper names;
+       filename stems; suggestedReferences filenames.
+       If storyText uses kinship but pageContent shows a visible social role, use the on-screen role
+       (e.g. parent behind the counter → "the shopkeeper in an apron", NOT "mom"; colleague at a
+       desk → "the analyst in a rolled-sleeve shirt", NOT "my brother"; seated authority figure in
+       frame → "the chairperson in a dark suit", NOT "the father").
+       Repeat the SAME role label for a figure across consecutive beats in a section when the still
+       shows the same person. Use lowercase role phrases after the first word of a sentence
+       ("the official in dark blue robes", not kinship terms); do not invent new synonyms for the
+       same visible figure in adjacent beats unless pageContent changes their on-screen role.
+   (c) MOTION ENERGY & TEMPO — readable on screen in 5s. Prefer a short ACTION CHAIN (2–4 linked beats in ONE continuous take), not a single vague mood. Scale speed, amplitude, and urgency from pageContent + storyText + outlineSectionSummary + narrativePlane:
+       • urgent / chaos / chase / battle / confrontation / shock → FAST, STRONG motion: sharp head turns, quick weight shifts, sudden reaches, strained pulls, half-steps in quick succession, clenched jaw, eyes snap to [role], hands jerk or clamp;
+       • calm / tender / reflective / intimate / aftermath → UNHURRIED but still VISIBLE motion: one measured breath cycle, a single slow nod, a held pause, a small 5-degree lean, fingertips settle on fabric — smaller amplitudes, slower cadence, never vague stillness;
+       • social / dialogue / pride / banter → clear speaking rhythm, head bobs, hand gestures, eye contact shifts between roles; add posture beats when pageContent allows (lean-in, straighten, step closer, sit forward on the chair edge, look up toward [role] — use bow / kneel only when the still already shows that register);
+       • rescue / impact / physical contact → strain, pull, half-steps, supporting another body, reciprocal bracing;
+       • grief / outburst → tears at the rim, shoulders shake once, lean forward, sharp mouth movement;
+       • env-only → wind, rain, smoke, dust, foliage, traffic, screens, flames, particles (no invented people).
+       Name the tempo in the verbs (snap / jerk / rush / strain vs hold / settle / unhurried / measured) so WAN reads the emotional register, not one default speed for every beat.
+   (d) CHARACTER MOTION — CONCRETE kinetic verbs anchored to measurable body parts. For EVERY on-screen character named in pageContent / WHO IS WHERE — and any other figure clearly visible in pageContent even if WHO IS WHERE is sparse — give at least TWO visible body zones, with at least ONE from hands/arms OR feet/legs/weight when framing shows them. Stack SOLO limb motion (hands, arms, feet, legs, torso, head/face) that does NOT require touching another person — do not rely on contact alone. Full-body / medium / walking / standing beats → include a foot or leg anchor; close-up beats → hand, sleeve, collar, or jaw still counts. Include at least 2 of:
+       • Body / torso: "chest rises and falls with one slow breath", "shoulders rise then drop", "his torso leans forward 5 degrees", "spine straightens", "ribs expand on an inhale".
+       • Feet / legs / stance: "she takes one half-step forward", "he takes two quick strides and brakes", "his weight shifts onto the front foot", "heels lift then settle", "one boot scrapes half an inch on gravel", "knees bend as she crouches lower", "ankles roll with a small balance correction".
+       • Posture / whole-body — WHEN pageContent staging allows (bowing, seated, kneeling, rising, turning, bending, ducking, looking up/down): add ONE clipped whole-body beat with measurable degrees; do NOT invent incompatible transfers the still locks out (e.g. already seated → upper-body bow/lean/head lift only; do NOT chain full sit then stand in 5s):
+         "torso bows forward 10 degrees at the waist", "head dips in a short bow then lifts", "drops onto the bench edge with a controlled sit", "rises one inch from the seat edge then settles", "pivots 20 degrees on planted feet", "shoulders and hips rotate 15 degrees toward [role]", "waist bends forward 5 degrees then straightens", "ducks 5 degrees under a low branch", "spine straightens from a hunch", "gaze lifts 15 degrees toward the screen / sky / doorway", "chin angles down toward the floor", "lunges one quick half-step then brakes".
+       • Head: "chin tilts down 5 degrees", "head turns 10 degrees toward [role]", "single slow nod", "chin lifts a touch", "eyes snap up and lock with [role]".
+       • Eyes / face: "blinks once slowly", "lashes lower then lift", "eyes flick to the right then back", "gaze locks toward [role]", "the corners of his mouth pull upward into a sharp smirk", "jaw clenches", "brow lifts", "tears well at the rims".
+       • Mouth: "lips part about half a centimetre and close again", "lips part and close in a clear speaking rhythm — short pauses every two beats".
+       • Hands / arms (solo or prop, not only touch): "right hand lifts and points sharply", "open palm extends then withdraws", "fingertips curl tighter into sleeve fabric", "fingers flex once around the cup", "wrist rotates 10 degrees", "forearm crosses the chest then drops", "sleeve cuff is tugged once".
+       • Hands / contact (when interaction fits): "one hand steadies [role]'s shoulder", "fingers wrap around [role]'s wrist", "palms brace against [role]'s back".
+   (e) INTERACTION — when 2+ characters share the frame (pageContent / WHO IS WHERE), choreograph RECIPROCAL motion across roles — not one mover and frozen bystanders. Give at least TWO linked interaction beats (speaker + listener, rescuer + injured, giver + receiver): e.g. the barista slides a cup forward while the customer reaches; the instructor points at the board while a student in the front row nods; the pilot flips a switch while the copilot watches the readout and taps back; the teammate passes a towel while the goalie wipes his face and nods. Name the role each motion belongs to; include eye-lock, hand-off, bracing, mirroring nods, or reactive flinch when the beat supports it. Even when roles do NOT touch, each visible figure still needs their own solo hand/foot/torso motion from rule (d) — not only mirrored nods or gaze.
+       LISTENERS / OBSERVERS / BACKGROUND figures (any visible non-speaker in pageContent or WHO IS WHERE — including soft-focus, over-the-shoulder, edge-of-frame, or mid-ground roles): give READABLE gestures, not gaze-only wallpaper. Per observer, include ≥2 body zones with at least ONE hand/arm OR foot/leg anchor — e.g. single nod, weight shift onto the back foot, heel lifts once, fingers tap the armrest or notepad, sleeve cuff tugged once, chin turns 10 degrees toward the speaker, open palm lifts then lowers, forearm crosses the chest then drops, one half-step to square stance, pen or cup rotated once in hand. FORBIDDEN observer-only wording without anchors: "watches", "observes", "listens intently", "gaze fixed", "stands in the background" with no hand/foot/torso verb. In dialogue clusters, animate EVERY visible listener/observer named or implied in pageContent, not only the primary speaker.
+   (f) CAMERA — ONE continuous camera path for the whole clip (no cuts). MANDATORY in every CHARACTER beat unless env-only. Match pageContent shot size / angle; make zoom/dolly/track AND one in-clip angle/height drift READABLE over ~5s when not a static hold — cinematic push-in for intimacy, tension, or dialogue emphasis; pull-back / dolly-out for scope, aftermath, or widening context; lateral track/pan to follow urgent movement. Combine up to TWO of {zoom/dolly, angle/height, lateral/track} in ONE phrase when the still supports it:
+       • ZOOM / DOLLY: "slow dolly-in from medium-wide to medium", "slow push-in toward the face", "slow pull-back from medium to medium-wide", "micro-zoom-in (~10% over the clip)", "slow dolly-in tightening from waist-up to medium close-up".
+       • ANGLE / HEIGHT: "eye-level", "slight low-angle (5–15 degrees)", "high-angle wide", "over-the-shoulder from behind [role]", "camera drifts from eye-level to a 10-degree low-angle", "tilt down 5 degrees toward the hands".
+       • IN-CLIP ANGLE DRIFT — MANDATORY whenever zoom/dolly or lateral/track is present: add ONE smooth angle/height change over ~5s in the SAME camera phrase (not a fixed label alone): "while the angle drifts from eye-level to a 10-degree low-angle", "while the camera eases from high-angle toward eye-level", "tilt down 5 degrees toward the hands", "while the frame tilts down 5 degrees toward [role]'s face". Use 5–15 degrees or a named tilt toward the subject. FORBIDDEN with zoom/dolly/track: "angle remains eye-level", "camera angle remains", "maintaining eye-level", "maintaining the slight low-angle", or any locked-angle wording with no drift/tilt clause. Skip drift only on a true static hold (rule HOLD) with no zoom/dolly/track.
+       • LATERAL / TRACK: "slow lateral pan-right", "slow truck-left following her movement", "slow quarter-orbit around the subject".
+       • HOLD: "static eye-level hold" only when pageContent is already a tight emotional close-up and subject motion carries the shot — still name angle (eye-level / low-angle / high-angle). If you add any zoom/dolly, pair it with a 5-degree tilt toward the face instead of a pure static hold.
+       FORBIDDEN camera language: jump-cut zoom, whip-pan, 360 spin, "cuts to new angle", rack focus between subjects, montage, cross-dissolve.
+   (g) Ambient motion if appropriate — match pageContent setting only: "rain streaks down the window", "neon signage flickers", "leaves flutter in the breeze", "distant traffic blurs past", "dust motes drift in a sunbeam", "steam rises from a mug", "embers and smoke swirl", "holographic UI elements pulse". One short ambient clause per beat; do NOT paste the same ambient motif across consecutive beats in the same thread when neighbor context already used it (vary breeze, light, dust, fabric, distant motion, or omit).
+   (h) FORBIDDEN softeners on CHARACTER motion — WAN treats these as "frozen subject" and animates only camera + ambient: "subtle", "subtly", "barely", "imperceptible", "a fraction", "almost", "slight movement", "slightly", "small" (when softening a gesture, e.g. "small wave"), "gentle", "gently", "soft", "softly", "quietly", "faint", "faintest", "minimal", "minimally", "hushed", "delicate", "lazy", "lazily", "touch of", "nearly motionless", "remains motionless", "stands still" (unless the SAME sentence also gives an explicit body-anchor verb with a measurable amount). Replace with measurable verbs and degrees (5-degree bow, half-step, one nod, sharp smirk, heel lifts once). Allowed: camera geometry ("slight low-angle", "micro push-in") and one short memory-grade / DoF clause per flashback beat (rule k).
+   (i) ONE CONTINUOUS TAKE — WAN cannot cut, dissolve, or rack-focus across multiple subjects mid-clip. FORBIDDEN in motionPrompt: "montage", "cross-dissolve", "cuts to", "rack focus", "split screen", "then we cut to". Pick ONE primary action chain in ONE place; camera zoom/angle change must be one smooth path, not a new shot.
+   (j) DIALOGUE beats (a character speaks): WAN cannot lipsync from text alone. Describe lips/mouth motion in clear speaking rhythm with body anchors (head bobs, breath, hand gesture), then APPEND at the end: "(lipsync polished in post)".
+   (k) FLASHBACK beats: briefly carry the memory-grade register from pageContent into the motion clip (e.g. "cool desaturated memory grade with light grain", "sepia memory tone with vignette"). One short clause is enough.
+   (l) ENV-ONLY beats (no characters in pageContent): describe ONLY environment motion (rain on glass, traffic blur, mist, dust, foliage, screens, neon, steam, embers, particles). Do NOT add the "Subject motion priority" suffix.
+   (m) END every CHARACTER beat with this exact cue line: "Subject motion priority over camera; characters move clearly, not frozen." Then add duration + framerate: "5s, 24fps" (use "3s, 24fps" for very short story lines, or "6s, 24fps" for the rare beat near the 8s ceiling).
+   (n) NO source-language proper nouns inside motionPrompt. NO rendered text. NO captions / subtitles / speech bubbles / signs. NO kinship/relation labels when a visual archetype role is available in pageContent (see rule b).
+   (o) GENRE & TEMPLATE NEUTRALITY — GOOD/BAD examples below illustrate syntax, tempo, camera, and body anchors only; they are NOT a default story template. Derive every motionPrompt from THIS beat's pageContent + WHO IS WHERE + narrativePlane. Do NOT import setting-specific props, postures, or ambient cues from examples when the still shows another world (no dynasty court, war camp, palace, or rural period staging on a modern office / school / street / apartment / clinic / starship / café beat unless pageContent already locks that look). Match visible furniture, props, and social roles in the still — not a favorite genre from the rule text.
+   (p) BEFORE YOU EMIT — quick self-check per beat: (1) every visible character has ≥2 body zones including hand/foot/torso when framing allows; (2) every listener/observer/background figure has a readable hand or foot gesture, not gaze-only; (3) if zoom/dolly/track appears, the camera phrase includes a drift/tilt clause — not "remains" / "maintaining" angle; (4) zero forbidden softeners on character motion; (5) dialogue speaker beats end with "(lipsync polished in post)"; (6) env-only beats omit the Subject motion priority suffix; (7) role labels match pageContent, not kinship from storyText.
 
    STRUCTURE — write motionPrompt in this order, as ONE plain prose paragraph (no bullets):
-     [subject action chain with concrete kinetic verbs + body anchors] [one camera move] [ambient motion if appropriate] [memory-grade tag if flashback] [Subject motion priority cue if a character is in frame] [duration + fps tag]
+     [subject action chain with tempo-matched kinetic verbs + solo hand/foot/torso/posture anchors on every visible role when pageContent allows, plus multi-role interaction when 2+ figures share the frame] [one continuous cinematic camera path: zoom/dolly in or out and/or lateral track combined with one in-clip angle/height drift when not a static hold] [ambient motion if appropriate] [memory-grade tag if flashback] [Subject motion priority cue if a character is in frame] [duration + fps tag]
 
-   GOOD EXAMPLE (dialogue close-up):
-     "The general's lips part and close in a clear natural speaking rhythm with short pauses every two beats; his chin bows half an inch lower at the end of each phrase, then rises again; he blinks once slowly; his shoulders rise and fall with two calm breaths. Static eye-level hold, medium close-up. Soft autumn breeze on hair and collar fabric, distant banners ripple in shallow DoF. Subject motion priority over camera; characters move clearly, not frozen. (lipsync polished in post) 5s, 24fps."
+   GOOD EXAMPLE (multi-character dialogue — any setting):
+     "The presenter in a charcoal blazer leans forward 5 degrees at the podium, speaks with clear lip rhythm, and lifts an open palm toward the slide screen; her weight shifts onto her front foot. The panelist in a rolled-sleeve shirt gives a single nod, taps a pen twice on the notepad, and rocks once in his chair; the attendee in the front row shifts onto her back foot, angles her gaze between them, and curls one hand around her program booklet. Slow push-in from medium to medium close-up while the angle drifts from eye-level to a 10-degree low-angle on the presenter's face. Ceiling lights shimmer, blinds sway at the window. Subject motion priority over camera; characters move clearly, not frozen. (lipsync polished in post) 5s, 24fps."
 
-   GOOD EXAMPLE (env-only flashback):
-     "A weathered ancient stone wall stands against pale sky; a gentle visible breeze of swirling light particles and thin dust flows through cracks and gaps, a small trail spilling out the other side. Very slow push-in toward the cracks, low-angle wide shot. Soft sepia memory tone with subtle vignette, drifting motes. 5s, 24fps."
+   GOOD EXAMPLE (café service interaction):
+     "The barista in a green apron slides a cup forward on the counter; the customer in a hoodie reaches, wraps fingers around the cup, and nods once; the barista wipes the counter edge with one back-and-forth swipe while shifting weight to her back foot. Slow push-in from medium to medium close-up while the angle drifts from eye-level to a 10-degree low-angle on the barista's hands. Steam rises from the espresso machine, pendant lights shimmer. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (sci-fi cockpit interaction):
+     "The pilot in a flight suit snaps a switch on the console and tightens their grip on the yoke; their boot braces once against the floor panel; the copilot beside them jerks their head 15 degrees toward the warning panel, taps the screen once, and braces a palm on the console as both torsos rock with a short turbulence jolt. Fast lateral truck-right, eye-level medium shot, while the angle drifts down 5 degrees toward the warning panel. Instrument lights pulse, HUD reflections drift across the canopy. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (physical support — any setting):
+     "The passerby in a raincoat strains under the other person's arm; she yanks him one urgent half-step toward the curb, her rear shoe dragging half an inch on wet pavement, his head lolling, while his fingers clamp her sleeve and her free hand reaches for the railing; headlights smear past in the background. Handheld-feel dolly-in on the forward pull while the frame tilts down 5 degrees toward their clasped grip, eye-level, urgent forward motion. Rain beads streak on the awning. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (tender aftermath — unhurried interaction):
+     "The volunteer in a clinic vest leans forward and lifts a paper cup to the seated patient's lips; her knees settle lower on the linoleum and her free hand smooths the blanket once; he blinks once, parts his lips to drink, and his fingers curl once around her wrist; she holds his gaze, brow furrowed, chest rising with one measured breath. Slow micro push-in toward their faces while the angle drifts down 5 degrees toward the cup at his lips, eye-level medium close-up. Fluorescent light hums, a wall clock ticks. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (solo walk — limb motion without contact):
+     "The pedestrian in a hooded coat takes two quick half-steps at the crosswalk, front foot landing toe-first; shoulders and hips pivot 15 degrees toward the opposite curb; her left hand pins the coat flap to her chest while her right hand stays near the tote strap; her head turns 10 degrees left then right, jaw set, gaze lifting 10 degrees toward the walk signal. Slow lateral pan-right, high-angle wide shot, while the camera eases from high-angle toward eye-level. Crosswalk sign flashes, traffic blurs past. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (eye-contact interaction + camera drift):
+     "The student in a school blazer suddenly lifts her head; her eyes snap up and lock with the classmate's gaze across the aisle; he lifts his chin 5 degrees and curls one hand tighter around his pencil; a held tense beat, neither blinking. Slow push-in from medium close-up to tight close-up while the angle drifts from a 5-degree low-angle to eye-level, background falling into shallow DoF, only light hair sway. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (env-only):
+     "Rain streaks down a city window while headlights smear into blurred moving bands outside; a ceiling lamp flickers once; condensation beads slide down the glass. Very slow push-in toward the window while the angle eases from eye-level interior wide toward a 5-degree low-angle on the rain-streaked glass. Cool blue night palette, drifting rain haze. 5s, 24fps."
+
+   BAD EXAMPLE (wrong labels — any genre):
+     "Dad's lips part in a calm speaking rhythm while Mom nods by the counter." / "The father's lips part while the manager listens over his shoulder."
+     → kinship or informal family labels from storyText are not on-screen visual roles; WAN mis-assigns motion. Replace with roles from pageContent/WHO IS WHERE for THIS still (e.g. "the barista in a green apron ... the customer in a hoodie", "the manager in a charcoal blazer ... the analyst across the table", "the presenter at the podium ... the panelist in the front row" — match the image, do not copy a fixed template).
 
    BAD EXAMPLE (DO NOT emit anything like this):
      "She has a subtle smile, lips barely move, almost imperceptible breath. Slow rack focus from her to him then montage of memories." → multiple forbidden tokens; WAN will produce a frozen still.
 
+   BAD EXAMPLE (under-interaction / wrong tempo):
+     "The speaker talks calmly while everyone else stands still. Slow push-in." → when multiple roles are in frame, listeners must react; match tempo to the beat (urgent scenes need sharp verbs, not default calm).
+
+   BAD EXAMPLE (gaze-only observers):
+     "The official speaks while the Emperor smiles in the background and the observer watches with a fixed gaze." → each visible listener/observer needs measurable hand, foot, or torso motion (nod, weight shift, sleeve tug, armrest tap), not watch/observe/gaze-only lines.
+
+   BAD EXAMPLE (face-only / frozen limbs):
+     "She smiles and blinks while standing still, hands at her sides." → add measurable hand, foot, or torso motion per visible role; do not animate only eyes/mouth while limbs stay locked.
+
+   BAD EXAMPLE (genre / template bleed):
+     "The official bows while golden leaves drift and an elderly ruler nods." on a modern café or office still → copied period-court motion from unrelated examples; use the visible roles, furniture, and props in pageContent instead.
+
+   BAD EXAMPLE (frozen camera angle with zoom):
+     "Slow micro-push-in toward the speaker while the camera angle remains eye-level." → any push-in / dolly / track MUST include a readable drift or tilt clause in the same phrase.
+
 HARD REMINDER — `motionPrompt` is FIELD #9 of the required JSON schema, NOT optional commentary.
 Every beat object you emit MUST contain a non-empty `motionPrompt` string. If a beat is reflective or
 mostly internal monologue with no obvious motion, default to a minimal valid prompt such as:
-"The character draws one slow breath; chest rises and falls once; lashes lower then lift in a single slow blink; chin tilts down half an inch then settles. Static eye-level hold, medium close-up. Soft ambient air movement around hair and collar. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+"The speaker in frame draws one slow breath; chest rises and falls once; lashes lower then lift in a single slow blink; chin tilts down half an inch then settles; right fingertips curl once into sleeve fabric while weight shifts onto the front foot. Static eye-level hold, medium close-up. Ambient air movement around hair and collar. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
 NEVER omit `motionPrompt`. NEVER set it to null, empty string, "TBD", or a placeholder.
 """
 
@@ -3530,13 +3612,16 @@ def generate_character_portrait(
 
     last_err: RuntimeError | None = None
     for attempt, temp in enumerate((0.42, 0.58), start=1):
-        response = client.models.generate_content(
-            model=image_model,
-            contents=parts,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-                temperature=temp,
+        response = _call_image_model_with_retry(
+            lambda temp=temp: client.models.generate_content(
+                model=image_model,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    response_modalities=["TEXT", "IMAGE"],
+                    temperature=temp,
+                ),
             ),
+            label=f"character_portrait({name!r}, attempt={attempt})",
         )
 
         img_bytes, img_mime = _extract_inline_image_from_response(response)
@@ -3792,6 +3877,53 @@ def _parse_char_args(pairs: list[str]) -> dict[str, Path]:
             raise SystemExit(f"Không tìm thấy file nhân vật: {p}")
         out[name] = p
     return out
+
+
+def _parse_optional_backfill_page_numbers(spec: str | None) -> frozenset[int] | None:
+    """
+  Parse pageNumber filter cho backfill motionPrompt.
+  Ví dụ: "1,3,5-8,12" → {1,3,5,6,7,8,12}. None / rỗng → không lọc (toàn bộ beat).
+  """
+    if spec is None or not str(spec).strip():
+        return None
+    out: set[int] = set()
+    for part in str(spec).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            try:
+                start = int(left.strip())
+                end = int(right.strip())
+            except ValueError as exc:
+                raise ValueError(f"đoạn range không hợp lệ: {token!r}") from exc
+            if start <= 0 or end <= 0:
+                raise ValueError(f"pageNumber phải > 0: {token!r}")
+            if start > end:
+                raise ValueError(f"range phải tăng dần: {token!r}")
+            out.update(range(start, end + 1))
+            continue
+        try:
+            pn = int(token)
+        except ValueError as exc:
+            raise ValueError(f"pageNumber không hợp lệ: {token!r}") from exc
+        if pn <= 0:
+            raise ValueError(f"pageNumber phải > 0: {token!r}")
+        out.add(pn)
+    if not out:
+        raise ValueError("danh sách pageNumber rỗng")
+    return frozenset(out)
+
+
+def _motion_backfill_neighbor_radius_from_args(args: Any) -> int:
+    """±N beat lân cận đưa vào ngữ cảnh backfill motionPrompt (mặc định 5, tối đa 20)."""
+    raw = getattr(args, "backfill_motion_neighbor_beats", _MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS
+    return max(0, min(n, _MOTION_BACKFILL_MAX_NEIGHBOR_RADIUS))
 
 
 def _gather_section_detection_texts(sec_scenes: list[Scene]) -> list[str]:
@@ -5385,6 +5517,8 @@ def backfill_motion_prompts_in_scenes_json(
     batch_size: int = 10,
     force: bool = False,
     review_checkpoint_path: Path | None = None,
+    only_page_numbers: frozenset[int] | None = None,
+    neighbor_radius: int = _MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS,
 ) -> int:
     """
     Đọc scenes.json sẵn có, với mỗi beat thiếu/empty `motionPrompt` gọi planner sinh prompt
@@ -5397,37 +5531,86 @@ def backfill_motion_prompts_in_scenes_json(
     sau mỗi batch lưu xong cũng sync motionPrompt vào checkpoint, để lần planner-resume kế tiếp
     không bị mất kết quả backfill.
 
+    `only_page_numbers`: nếu set, chỉ xử lý beat có `pageNumber` nằm trong tập này; None = toàn bộ.
+    `neighbor_radius`: mỗi beat trong batch đọc thêm ±N beat lân cận (ngoài batch) làm ngữ cảnh read-only.
+
     Trả về số beat đã backfill thành công.
     """
+    neighbor_radius = max(0, min(int(neighbor_radius), _MOTION_BACKFILL_MAX_NEIGHBOR_RADIUS))
     raw_text = scenes_path.read_text(encoding="utf-8")
     rows = json.loads(raw_text)
     if not isinstance(rows, list):
         raise SystemExit(f"scenes.json phải là JSON array: {scenes_path}")
 
+    if only_page_numbers:
+        present_pages = {
+            int(r.get("pageNumber"))
+            for r in rows
+            if isinstance(r, dict) and isinstance(r.get("pageNumber"), int)
+        }
+        missing_pages = sorted(only_page_numbers - present_pages)
+        if missing_pages:
+            preview = ", ".join(str(p) for p in missing_pages[:12])
+            tail = "..." if len(missing_pages) > 12 else ""
+            print(
+                f"  [WARN] backfill motionPrompt: không có pageNumber trong scenes.json: "
+                f"{preview}{tail}",
+                file=sys.stderr,
+            )
+
     targets: list[tuple[int, dict[str, Any]]] = []
     for idx, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
+        pn = row.get("pageNumber")
+        if only_page_numbers is not None:
+            if not isinstance(pn, int) or pn not in only_page_numbers:
+                continue
         existing = (row.get("motionPrompt") or "").strip()
         if force or not existing:
             targets.append((idx, row))
 
     if not targets:
-        print(
-            f"motionPrompt đã đủ cho toàn bộ {len(rows)} beat trong {scenes_path}. "
-            "Không cần backfill.",
-            file=sys.stderr,
-        )
+        if only_page_numbers:
+            scope = ", ".join(str(p) for p in sorted(only_page_numbers))
+            print(
+                f"motionPrompt: không có beat nào cần backfill trong phạm vi pageNumber "
+                f"[{scope}] của {scenes_path}"
+                f"{' (đã đủ hoặc không khớp pageNumber)' if not force else ''}.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"motionPrompt đã đủ cho toàn bộ {len(rows)} beat trong {scenes_path}. "
+                "Không cần backfill.",
+                file=sys.stderr,
+            )
         return 0
 
-    n_already = len(rows) - len(targets)
+    if only_page_numbers:
+        in_scope = sum(
+            1
+            for r in rows
+            if isinstance(r, dict)
+            and isinstance(r.get("pageNumber"), int)
+            and r["pageNumber"] in only_page_numbers
+        )
+        n_already = max(0, in_scope - len(targets))
+    else:
+        n_already = len(rows) - len(targets)
     n_total_batches = (len(targets) + batch_size - 1) // batch_size
     resume_note = (
         f" (skip {n_already} beat đã có motionPrompt → resume)" if n_already > 0 and not force else ""
     )
+    scope_note = ""
+    if only_page_numbers:
+        scope_note = (
+            f", chỉ pageNumber [{', '.join(str(p) for p in sorted(only_page_numbers))}]"
+        )
     print(
         f"Backfill motionPrompt: {len(targets)}/{len(rows)} beat cần điền"
-        f"{resume_note}; batch={batch_size}, n_batches={n_total_batches}, model={planner_model}.",
+        f"{resume_note}{scope_note}; batch={batch_size}, n_batches={n_total_batches}, "
+        f"context=±{neighbor_radius} beat, model={planner_model}.",
         file=sys.stderr,
     )
 
@@ -5439,10 +5622,12 @@ def backfill_motion_prompts_in_scenes_json(
         if not isinstance(nb, dict):
             return None
         story_text_raw = (nb.get("storyText", "") or "").strip()
+        page_content_raw = (nb.get("pageContent", "") or "").strip()
         return {
             "pageNumber": nb.get("pageNumber"),
             "narrativePlane": nb.get("narrativePlane") or "present",
             "storyText": story_text_raw[:200],  # truncate dài để tiết kiệm token
+            "pageContent": page_content_raw[:280],
         }
 
     n_filled = 0
@@ -5465,14 +5650,16 @@ def backfill_motion_prompts_in_scenes_json(
                 }
             )
 
-        # (A) Neighbor window ±2: với mỗi target lấy 2 beat trước (-1, -2) + 2 beat sau (+1, +2)
-        # nếu CHƯA nằm trong batch. Chỉ giữ pageNumber + narrativePlane + storyText (truncated)
-        # — KHÔNG yêu cầu motionPrompt. Phục hồi adjacency awareness rộng hơn ở biên batch
-        # (tonal continuity giữa các beat liền kề + nhịp 2-beat liên hoàn).
+        # (A) Neighbor window ±neighbor_radius: với mỗi target lấy N beat trước/sau nếu CHƯA nằm
+        # trong batch. Chỉ giữ pageNumber + narrativePlane + storyText/pageContent (truncated)
+        # — KHÔNG yêu cầu motionPrompt. Cửa sổ rộng hơn giúp nhịp section + nhãn vai ổn định.
         neighbor_items: list[dict[str, Any]] = []
         seen_neighbor_pages: set[Any] = set()
         for tgt_idx, _ in chunk:
-            for n_idx in (tgt_idx - 2, tgt_idx - 1, tgt_idx + 1, tgt_idx + 2):
+            for off in range(-neighbor_radius, neighbor_radius + 1):
+                if off == 0:
+                    continue
+                n_idx = tgt_idx + off
                 if n_idx in batch_row_indices:
                     continue
                 summary = _neighbor_summary(n_idx)
@@ -5488,10 +5675,11 @@ def backfill_motion_prompts_in_scenes_json(
 
         if neighbor_items:
             neighbor_block = (
-                "ADJACENT CONTEXT BEATS — up to 2 beats before and 2 beats after each target "
-                "(read-only — for tonal / adjacency awareness only; DO NOT generate motionPrompt "
-                "for these, they are NOT in the batch). Use them to understand the local motion arc "
-                "(decelerating → calm; building → climactic; calm → reaction) across a ~5-beat window:\n"
+                f"ADJACENT CONTEXT BEATS — up to {neighbor_radius} beats before and {neighbor_radius} "
+                "beats after each target (read-only — for tonal / adjacency awareness only; DO NOT "
+                "generate motionPrompt for these, they are NOT in the batch). Use them to understand "
+                f"the local motion arc across a ~{max(1, neighbor_radius * 2 + 1)}-beat window and to "
+                "keep on-screen role labels consistent with nearby pageContent / WHO IS WHERE:\n"
                 + json.dumps(neighbor_items, ensure_ascii=False, indent=2)
                 + "\n\n"
             )
@@ -5503,9 +5691,29 @@ You are filling in the MISSING field `motionPrompt` (WAN 2.1 image-to-video prom
 of already-planned story beats. Each beat already has a fixed `pageContent` (a static visual
 description of the still image) and `storyText` (the narration TTS). You only produce `motionPrompt`.
 
+Write motion that is READABLE on screen in ~5s: chained actions, tempo matched to the beat
+(urgent / fast / strong vs unhurried / measured), clear facial expression, solo hand/foot/torso
+and posture anchors on every visible role when pageContent allows (bow, bend at the waist, sit or
+rise on the seat edge, quick steps, pivot/turn on planted feet, look up or down — only if compatible
+with the locked still pose), and reciprocal multi-role interaction when several figures share the
+frame — match the energy of strong I2V reference prompts (clear gestures, half-steps, weight shifts,
+sleeve/hem adjustments, eye-lock, strain/pull, clenched jaw, sharp smirk, hand-offs, mirroring nods).
+Give every listener, observer, and background figure in pageContent readable hand or foot gestures,
+not gaze-only reactions. Include ONE continuous cinematic camera path with visible zoom/dolly
+in or pull-back out, or lateral track/pan, combined with one smooth in-clip angle/height drift
+(5–15 degrees or tilt toward the subject) when pageContent framing allows (no jump cuts).
+Label every mover from pageContent WHO IS WHERE + visible on-screen archetype for THAT beat's genre
+and setting — never kinship from storyText alone (father, mother, sister, a tỷ) and never
+source-language proper names. Do NOT copy costumes, props, or ambient cues from the rule examples
+when this beat's pageContent shows a different world; examples teach syntax only (rule o).
+
 Each batch item also carries `outlineSectionSummary` — the section-level tonal arc the beat belongs
-to. Use it to keep motion intensity / mood consistent with the section's emotional register
-(e.g. climactic section → stronger kinetic verbs; reflective section → quieter body anchors).
+to. Use it to keep motion tempo, interaction density, and camera energy consistent with the section's
+emotional register (e.g. climactic / battle section → faster, stronger verbs and tighter push-ins;
+reflective / tender section → unhurried measured body anchors with slower micro push-ins; dialogue clusters
+→ reciprocal speaker/listener motion on every visible role).
+
+Before returning JSON, run rule (p) self-check on EACH beat in the batch.
 
 {_WAN_MOTION_PROMPT_RULES}
 
@@ -5513,14 +5721,19 @@ to. Use it to keep motion intensity / mood consistent with the section's emotion
 {json.dumps(target_items, ensure_ascii=False, indent=2)}
 
 Task: For EACH batch beat (NOT for neighbor context beats), produce ONE WAN 2.1 motion prompt that animates THAT beat's still image.
-Where adjacent context is provided (up to 2 beats before and 2 beats after the batch), make the motion of each batch beat fit naturally into the local 5-beat arc:
-  • Read the 2 preceding context beats (if any) to understand the kinetic state the character is COMING FROM (e.g. running → slowing; weeping → recovering; tense silence → breaking).
-  • Read the 2 following context beats (if any) to understand the kinetic state the character is HEADING INTO (e.g. about to stand up → end with weight shift; about to flinch → end with held breath).
+Where adjacent context is provided (up to {neighbor_radius} beats before and {neighbor_radius} beats after the batch), make the motion of each batch beat fit naturally into the local arc:
+  • Read the preceding context beats (if any) to understand the kinetic state the character is COMING FROM (e.g. running → slowing; weeping → recovering; tense silence → breaking).
+  • Read the following context beats (if any) to understand the kinetic state the character is HEADING INTO (e.g. about to stand up → end with weight shift; about to flinch → end with held breath).
+  • Reuse the same on-screen role labels already established in nearby pageContent / WHO IS WHERE (do not fall back to kinship terms from storyText).
   • Match breath cadence, head orientation, hand position, and energy level so consecutive clips can be cut/lipsynced together without jarring discontinuity.
+  • If a zoom/dolly/track phrase would lock angle ("remains eye-level", "maintaining eye-level"), rewrite it with a drift/tilt clause before emitting.
+  • Scan for forbidden character softeners (rule h); replace with measurable motion.
+  • Give every visible figure in pageContent at least one hand/foot/torso anchor when framing allows, even in multi-speaker dialogue.
+  • For each listener/observer/background role, add a readable hand or foot gesture (nod, weight shift, sleeve tug, armrest tap, half-step) — never gaze-only or watch/observe without body anchors.
 
 Output MUST be a JSON array of the SAME length and SAME order as the BATCH BEATS array, where each object has EXACTLY two keys:
   - "pageNumber" (int, matching the input pageNumber)
-  - "motionPrompt" (non-empty string, 60-110 words, following ALL rules above)
+  - "motionPrompt" (non-empty string, 70-120 words, following ALL rules above)
 
 Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys other than pageNumber + motionPrompt.
 """
@@ -5531,7 +5744,7 @@ Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys
                 model=planner_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.5,
+                    temperature=0.35,
                     response_mime_type="application/json",
                 ),
             )
@@ -5902,11 +6115,34 @@ def main() -> None:
         help="Đi kèm --backfill-motion-prompts: ép overwrite cả những beat đã có motionPrompt.",
     )
     parser.add_argument(
+        "--backfill-motion-pages",
+        type=str,
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Tùy chọn: chỉ backfill motionPrompt cho các pageNumber trong scenes.json. "
+            "Định dạng: 1,3,5-8,12. Không chỉ rõ thì xử lý toàn bộ beat (hoặc mọi beat thiếu "
+            "khi auto-backfill). Dùng với --backfill-motion-prompts."
+        ),
+    )
+    parser.add_argument(
         "--backfill-batch-size",
         type=int,
         default=10,
         metavar="N",
         help="Số beat / batch khi backfill motionPrompt (mặc định 10). Giảm nếu hay 429/timeout.",
+    )
+    parser.add_argument(
+        "--backfill-motion-neighbor-beats",
+        type=int,
+        default=_MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS,
+        metavar="N",
+        help=(
+            "Backfill motionPrompt: số beat lân cận mỗi phía (±N) đưa vào ngữ cảnh read-only "
+            f"(pageContent/storyText rút gọn). Mặc định {_MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS}; "
+            f"tối đa {_MOTION_BACKFILL_MAX_NEIGHBOR_RADIUS}. Tăng (vd. 10) giúp nhịp section và "
+            "nhãn vai ổn định hơn nhưng tốn token — có thể cần giảm --backfill-batch-size."
+        ),
     )
     parser.add_argument(
         "--auto-split-long-beats",
@@ -6007,6 +6243,15 @@ def main() -> None:
         file=sys.stderr,
     )
 
+    try:
+        backfill_only_page_numbers = _parse_optional_backfill_page_numbers(
+            getattr(args, "backfill_motion_pages", None)
+        )
+    except ValueError as exc:
+        parser.error(f"--backfill-motion-pages: {exc}")
+
+    backfill_neighbor_radius = _motion_backfill_neighbor_radius_from_args(args)
+
     # Backfill motionPrompt cho scenes.json đã có — chạy nhanh, không cần --story.
     if getattr(args, "backfill_motion_prompts", False):
         out_dir_bf = args.output.expanduser().resolve()
@@ -6024,6 +6269,8 @@ def main() -> None:
             batch_size=int(getattr(args, "backfill_batch_size", 10) or 10),
             force=bool(getattr(args, "force_backfill_motion_prompts", False)),
             review_checkpoint_path=ck_for_bf if ck_for_bf.is_file() else None,
+            only_page_numbers=backfill_only_page_numbers,
+            neighbor_radius=backfill_neighbor_radius,
         )
         return
 
@@ -6143,6 +6390,8 @@ def main() -> None:
                             batch_size=int(getattr(args, "backfill_batch_size", 10) or 10),
                             force=False,
                             review_checkpoint_path=review_ck,
+                            only_page_numbers=backfill_only_page_numbers,
+                            neighbor_radius=backfill_neighbor_radius,
                         )
                     except Exception as exc:  # noqa: BLE001
                         print(
@@ -6353,6 +6602,8 @@ def main() -> None:
                             if (bf_target_path == manifest_path and review_ck.is_file())
                             else None
                         ),
+                        only_page_numbers=backfill_only_page_numbers,
+                        neighbor_radius=backfill_neighbor_radius,
                     )
                     # Cập nhật motion_prompt vào scenes in-memory (phòng bước sau cần dùng).
                     try:
