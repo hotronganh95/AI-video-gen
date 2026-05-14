@@ -3829,8 +3829,8 @@ Story:
 
 Return ONLY a JSON array (no markdown, no commentary). Each object MUST use these keys:
 
-- "canonicalName": The clearest name or title readers use for this person (match story spelling).
-- "aliases": Array of other strings that refer to the SAME person in this story (nicknames, titles, shortened names). Empty array [] if none.
+- "canonicalName": COPY-PASTE exactly one string from the Story that names this person. Priority when choosing which string: (1) clearest real / full personal name as the text spells it > (2) stable nickname the text uses > (3) official role or title the text uses if no personal name appears. Do NOT add parentheses, English, translator notes, glosses, or any characters not present in the Story.
+- "aliases": Other strings the Story literally uses for this same person; each MUST be copy-pasted verbatim from the Story (contiguous substring). No invented labels, no commentary. Use [] if none. Keep the list short.
 - "evidenceQuote": ONE short verbatim quote (20-90 characters if possible) copied EXACTLY from the story above that proves this character appears—must be findable as a substring of the story text. If the snippet contains dialogue with double quotes ("), REPLACE those inner double quotes with single quotes (') OR with curly quotes (“ ”) BEFORE putting it into the JSON value, so that the surrounding JSON string is not broken.
 - "visualDescription": 4-8 sentences for IMAGE CONSISTENCY. Include ONLY:
   • Approximate age or age band AS IMPLIED by the text (if unclear, say "age not specified").
@@ -3850,24 +3850,37 @@ STRICT RULES:
 4. Merge the same person under ONE canonicalName (do not list duplicates).
 5. Maximum {max_characters} characters total—prioritize main, then supporting; omit the least important minors if over limit.
 6. If no suitable characters, return [].
+7. Before emitting JSON: drop any canonicalName or alias that is not a verbatim substring of the Story.
 
 Language of strings: match the story language for names and evidenceQuote.
 
-JSON SYNTAX: Valid JSON only.
+    JSON SYNTAX: Valid JSON only.
 - Do not put raw line breaks inside string values.
 - Do NOT put raw unescaped double quotes (") inside string values. If a quote-mark appears inside a value, either escape it as \\" OR rewrite it as a single quote ' or curly quote “ ”.
 - Double-check evidenceQuote: it MUST be a single, well-formed JSON string with NO inner unescaped " characters.
 """
 
-    response = client.models.generate_content(
-        model=planner_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
-    )
+    def _call_extract() -> Any:
+        return client.models.generate_content(
+            model=planner_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
 
+    response = _generate_with_transient_retry(
+        _call_extract,
+        label="extract_characters_from_story",
+        delays=(15, 35, 70, 120, 240),
+    )
+    if response is None:
+        raise RuntimeError(
+            "Trích nhân vật (extract_characters_from_story): Vertex/API trả 429 hoặc lỗi tạm thời "
+            "sau toàn bộ retry. Chờ vài phút, tăng `--planner-sleep-sec`, đổi `--planner-model` nhẹ hơn "
+            "cho bước này, hoặc dùng lại `characters_extracted.json` có sẵn (bỏ --regenerate-characters)."
+        )
     raw = _strip_json_fence(response.text or "")
     data = _json_loads_llm(raw)
     if not isinstance(data, list):
@@ -3893,9 +3906,9 @@ def refine_character_list(
     draft_json = json.dumps(draft, ensure_ascii=False, indent=2)
 
     prompt = f"""
-You are a strict continuity editor. You MUST compare the DRAFT character list to the FULL STORY and output a corrected list.
+You are a strict continuity editor. You MUST compare the DRAFT character list to the STORY text below and output a corrected list.
 
-FULL STORY:
+STORY (may be head+tail excerpt when the original is very long):
 \"\"\"
 {story_body}
 \"\"\"
@@ -3903,13 +3916,15 @@ FULL STORY:
 DRAFT LIST (JSON):
 {draft_json}
 
+Naming (same as casting pass): "canonicalName" and every "aliases" entry MUST be copy-pasted verbatim from the STORY text above. Priority for canonicalName: real/full personal name in text > nickname in text > official role/title in text. No English, no parentheses glosses, no invented strings.
+
 Tasks:
 1. DELETE entries that are not animate speaking/thinking characters (places, props-only names, abstract titles with no embodied scenes, duplicate merges already missing).
-2. MERGE duplicates: same individual under one canonicalName; union all aliases.
-3. ADD any major named on-page character who is clearly in the story but MISSING from the draft (with correct evidenceQuote and careful visualDescription).
-4. VERIFY each evidenceQuote appears verbatim (as substring) in the story; if not, replace with a correct short verbatim quote from the story or remove that character if they do not appear.
-5. REWRITE visualDescription so every trait is either directly supported by the story OR explicitly marked "not specified in text". Remove fanciful inventions.
-6. Cap the final list at {max_characters} entries: keep main first, then supporting, then minor.
+2. MERGE duplicates: one row per person; choose canonicalName by the priority above; aliases only other verbatim substrings from the STORY for that person. Remove draft strings that are not verbatim in the STORY excerpt. Do not invent aliases.
+3. ADD any major named on-page character clearly in the story but MISSING from the draft (verbatim names, correct evidenceQuote, careful visualDescription).
+4. VERIFY each evidenceQuote appears verbatim (substring) in the full original story when possible, else in this excerpt; fix or remove if wrong.
+5. REWRITE visualDescription so every trait is supported by the story OR marked "not specified in text". Remove inventions.
+6. Cap the final list at {max_characters} entries: main first, then supporting, then minor.
 
 Return ONLY a JSON array of objects with keys:
 canonicalName, aliases (array), evidenceQuote, visualDescription, importance.
