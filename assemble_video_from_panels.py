@@ -7,8 +7,8 @@ Input A — manga (postprocess_split_panels):
   - audio_root/index.json, page_XX/panel_YY.wav (tùy chọn)
 
 Input B — review / review_two_pass + tts_ngoc_huyen_panels (layout scene_XX):
-  - audio_root/index.json (wav: scene_NN.wav, image: ../scene_NN.png hoặc tương đối)
-  - ảnh scene_XX.png thường ở thư mục cha của audio_root (hoặc --images-dir)
+  - audio_root/index.json (wav: scene_NN.wav, image: ../scenes/scene_NN.png hoặc ../scene_NN.png)
+  - ảnh beat thường ở thư mục cha của audio_root trong scenes/ (hoặc --images-dir)
 
 Input C — i2v (clip đã sinh + TTS):
   - index.json + scene_NN.wav trong audio_root (giống review), hoặc chỉ các file scene_NN.wav (quét tự động)
@@ -89,10 +89,11 @@ def _load_json(path: Path) -> Any:
 
 def _resolve_scene_stem_image(images_dir: Path, page: int) -> Path | None:
     stem = f"scene_{int(page):02d}"
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        p = images_dir / f"{stem}{ext}"
-        if p.is_file():
-            return p.resolve()
+    for base in (images_dir / "scenes", images_dir):
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            p = base / f"{stem}{ext}"
+            if p.is_file():
+                return p.resolve()
     return None
 
 
@@ -925,7 +926,7 @@ def main() -> None:
         "--images-dir",
         type=Path,
         default=None,
-        help="Review: thư mục chứa scene_XX.png (mặc định: thư mục cha của --audio-root).",
+        help="Review: thư mục chứa scenes/scene_XX.* hoặc scene_XX.* (mặc định: thư mục cha của --audio-root).",
     )
     ap.add_argument(
         "--video-root",
@@ -1039,7 +1040,7 @@ def main() -> None:
     if i2v_work is None and not items:
         raise SystemExit(
             "Không tìm thấy đoạn nào để ghép. Kiểm tra --mode, panels_root/page_XX/panels.json "
-            "hoặc audio_root/index.json + scene_XX.png (--images-dir nếu ảnh không nằm cạnh audio)."
+            "hoặc audio_root/index.json + scenes/scene_XX.* (--images-dir nếu ảnh không nằm cạnh audio)."
         )
 
     with tempfile.TemporaryDirectory(prefix="panel_vid_") as td:

@@ -272,19 +272,27 @@ def _verbatim_between_anchors(story: str, start_anchor: str, end_anchor: str) ->
     Lưu ý: anchor từ planner đôi khi nén nhiều dòng/blank line thành một newline duy nhất,
     còn story gốc lại có blank line / nhiều khoảng trắng — nên match whitespace-tolerant
     (mọi cụm whitespace trong anchor coi như \\s+ trong story).
+    Ngoài ra khớp không phân biệt hoa thường (vd. anchor \"Tóc mai…\" vẫn khớp \"tóc mai…\" trong truyện);
+    đoạn trả về luôn là slice nguyên văn từ story gốc (giữ đúng chữ trong file).
     """
     if not story or not start_anchor.strip() or not end_anchor.strip():
         return ""
 
     def _find_with_ws_tolerance(haystack: str, needle: str, from_idx: int = 0) -> tuple[int, int]:
-        i = haystack.find(needle, from_idx)
+        sub = haystack[from_idx:]
+        i = sub.find(needle)
         if i >= 0:
-            return i, i + len(needle)
+            abs_i = from_idx + i
+            return abs_i, abs_i + len(needle)
+        # Không phân biệt hoa thường; span lấy theo ký tự thật trong haystack (có thể khác độ dài needle hiếm gặp).
+        m_ci = re.search(re.escape(needle), sub, flags=re.DOTALL | re.IGNORECASE)
+        if m_ci is not None:
+            return from_idx + m_ci.start(), from_idx + m_ci.end()
         parts = [p for p in re.split(r"\s+", needle.strip()) if p]
         if not parts:
             return -1, -1
         pattern = r"\s+".join(re.escape(p) for p in parts)
-        m = re.search(pattern, haystack[from_idx:], flags=re.DOTALL)
+        m = re.search(pattern, sub, flags=re.DOTALL | re.IGNORECASE)
         if m is None:
             return -1, -1
         return from_idx + m.start(), from_idx + m.end()
@@ -388,6 +396,9 @@ _TTS_BEAT_MAX_SYLL = int(_TTS_SYLL_PER_SEC * _TTS_BEAT_MAX_SEC)  # 24
 _LONG_BEAT_AUTO_SPLIT_SEC = 10.0
 _MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS = 5
 _MOTION_BACKFILL_MAX_NEIGHBOR_RADIUS = 20
+_MOTION_BACKFILL_MISSING_PROMPT_RETRIES = 5
+# Wardrobe Bible: số lần thử lại cả khối (LLM + parse) khi None / JSON lỗi (sau _generate_with_transient_retry).
+_WARDROBE_BIBLE_OUTER_ATTEMPTS = 3
 
 
 def _tts_seconds_for_text(text: str) -> float:
@@ -453,7 +464,11 @@ _WAN_MOTION_PROMPT_RULES: str = """\
 9. motionPrompt — REQUIRED FIELD, MUST appear in EVERY beat object (never omit, never leave empty).
    This is a WAN 2.1 image-to-video (I2V) prompt that animates THIS beat's still image into a short clip
    (~3–5 seconds, matching the storyText TTS length). ALWAYS write in ENGLISH regardless of source language;
-   use ASCII apostrophes (not curly quotes). Length target: 70–120 words.
+   use ASCII apostrophes (not curly quotes). Length target by MOTION ENERGY tier (rule c):
+     • mild / calm → 50–110 words (avoid filler; mild beats are naturally compact).
+     • tension / dialogue with stakes → 70–130 words.
+     • rescue / chase / impact / outburst → 80–140 words (room for action chain).
+     • env-only → 50–100 words.
 
    WAN 2.1 I2V CONVENTIONS — STRICT (follow ALL):
    (a) Do NOT re-describe wardrobe / identity / setting / lighting / palette — the input still image already locks all of those. Describe ONLY what MOVES during the clip.
@@ -466,36 +481,44 @@ _WAN_MOTION_PROMPT_RULES: str = """\
        a green apron", "the detective in a trench coat", "the student in a school blazer", "the pilot
        in a flight suit", "the official in dark blue robes", "the shopkeeper behind the counter").
        FORBIDDEN as subject labels: kinship / relation words from storyText or narrator POV
-       (father, mother, sister, brother, daughter, son, wife, husband, uncle, aunt, elder sister,
-       younger sister, phu nhan, a ty, my father, her mother, etc.); source-language proper names;
-       filename stems; suggestedReferences filenames.
+       in ANY source language (English: father/mother/sister/brother/daughter/son/wife/husband/
+       uncle/aunt/elder sister/younger sister/my father/her mother; Vietnamese: phu nhan/a ty/
+       tieu thu/lao gia; CJK kinship terms; Spanish padre/madre/hermana; etc.); source-language
+       proper names; filename stems; suggestedReferences filenames.
        If storyText uses kinship but pageContent shows a visible social role, use the on-screen role
        (e.g. parent behind the counter → "the shopkeeper in an apron", NOT "mom"; colleague at a
        desk → "the analyst in a rolled-sleeve shirt", NOT "my brother"; official before a monarch
        → "the official in robes", NOT "the father").
        Repeat the SAME role label for a figure across consecutive beats in a section when the still
        shows the same person.
-   (c) MOTION ENERGY — readable on screen in 5s. Prefer a short ACTION CHAIN (2–4 linked beats in ONE continuous take), not a single vague mood. Match pageContent + storyText emotional register:
-       • calm / dialogue → speaking rhythm, head bobs, hand gestures, eye contact shifts;
-       • tension / confrontation → clenched jaw, tightened fists, held breath, sharp head turns, weight shifts;
-       • rescue / chase / impact → strain, pull, half-steps, supporting another body, urgent forward motion;
+   (c) MOTION ENERGY — readable on screen in 5s. Prefer a short ACTION CHAIN (2–4 linked beats in ONE continuous take), not a single vague mood. CALIBRATE intensity to the pageContent + storyText emotional register; do NOT default to the strongest tier. Pick ONE tier per beat:
+       • mild / reaction → restrained chuckle, polite smile, single short exhale, one short nod, eye-crinkle, brow lift, one fingertip tap, lips part about a centimetre and close (NO shoulder rocking, NO head throw, NO loud laugh, NO sharp gesture) — use for reaction shots, content beats, polite exchange, dawning understanding;
+       • calm / dialogue → speaking rhythm, head bobs, hand gestures, eye contact shifts, one open-palm gesture;
+       • tension / confrontation → clenched jaw, tightened fists, held breath, sharp head turns, weight shifts, hand lifts and points;
+       • rescue / chase / impact → strain, pull, half-steps, supporting another body, urgent forward motion, sharp lateral movement;
        • grief / outburst → tears at the rim, shoulders shake once, lean forward, sharp mouth movement;
        • env-only → wind, rain, smoke, dust, foliage, traffic, screens, flames, particles (no invented people).
+       Across ANY genre — slice-of-life, romance, comedy, kids, cooking, sports, dance, fantasy, sci-fi, horror, thriller, mystery, historical, nonfiction adaptation — most beats land in mild / calm / tension; only climactic beats in rescue / outburst tiers. If pageContent emotion is mild ("smiles", "chuckles", "nods", "blinks", "ponders"), STAY in mild tier and do NOT escalate to clenched-jaw / strain / outburst vocabulary.
+       NOTE — even at mild tier, rule (d) still applies: combine ≥2 of {Body, Head, Eyes/face, Mouth, Hands} into a 2–4 step chain (e.g. *lips part for one short exhale → chin dips 5 degrees once → shoulders rise and fall once → eyes crinkle*). A single isolated motion ("just a smile" / "just a nod") is NOT enough.
    (d) CHARACTER MOTION — CONCRETE kinetic verbs anchored to measurable body parts. For EVERY on-screen character named in pageContent / WHO IS WHERE, give at least ONE visible motion (not only camera + ambient). Include at least 2 of:
        • Body: "chest rises and falls with one slow breath", "shoulders rise then drop", "she takes one half-step forward", "his torso leans forward 5 degrees", "weight shifts onto the front foot".
        • Head: "chin tilts down 5 degrees", "head turns 10 degrees toward [role]", "single slow nod", "chin lifts a touch", "eyes snap up and lock with [role]".
        • Eyes / face: "blinks once slowly", "lashes lower then lift", "eyes flick to the right then back", "gaze locks toward [role]", "the corners of his mouth pull upward into a sharp smirk", "jaw clenches", "brow lifts", "tears well at the rims".
        • Mouth: "lips part about half a centimetre and close again", "lips part and close in a clear speaking rhythm — short pauses every two beats".
        • Hands / contact: "right hand lifts and points sharply", "open palm extends toward [role]", "fingertips curl tighter into sleeve fabric", "fingers wrap around the cup", "one hand steadies [role]'s shoulder".
-   (e) INTERACTION — when 2+ characters share the frame, choreograph reciprocal motion (speaker + listener): e.g. the barista slides a cup forward while the customer reaches; the instructor points at the board while a student in the front row nods; the pilot flips a switch while the copilot watches the readout; the official in robes bows while the monarch in the background nods once. Name the role each motion belongs to.
-   (f) CAMERA — ONE continuous camera path for the whole clip (no cuts). MANDATORY in every CHARACTER beat unless env-only. Match pageContent shot size / angle; make zoom OR reframing READABLE over ~5s. Combine up to TWO of {zoom/dolly, angle/height, lateral/track} in ONE phrase when the still supports it:
-       • ZOOM / DOLLY: "slow dolly-in from medium-wide to medium", "slow push-in toward the face", "slow pull-back from medium to medium-wide", "micro-zoom-in (~10% over the clip)", "slow dolly-in tightening from waist-up to medium close-up".
-       • ANGLE / HEIGHT: "eye-level", "slight low-angle (5–15 degrees)", "high-angle wide", "over-the-shoulder from behind [role]", "camera drifts from eye-level to a 10-degree low-angle", "tilt down 5 degrees toward the hands".
-       • LATERAL / TRACK: "slow lateral pan-right", "slow truck-left following her movement", "slow quarter-orbit around the subject".
-       • HOLD: "static eye-level hold" only when pageContent is already a tight emotional close-up and subject motion carries the shot — still name angle (eye-level / low-angle / high-angle).
+   (e) INTERACTION — when 2+ characters share the frame, name role-specific motion for the active mover(s). RECIPROCAL motion (speaker + listener both moving clearly) is the default ONLY when both roles drive the beat (e.g. dialogue exchange, hand-off, eye-lock, rescue). When pageContent shows ONE primary actor and other(s) merely observe, give the observer(s) MINIMAL motion only (one slow blink, one slow breath, head turns 5 degrees, eyes track the actor) — do NOT manufacture matching reciprocal gestures. Examples: the barista slides a cup forward while the customer reaches (reciprocal); the instructor points at the board while a student in the front row tracks the gesture with their eyes only (observer-minimal); the official bows while the monarch in the background gives a single nod (reciprocal). Match the interaction intensity to the MOTION ENERGY tier from rule (c).
+   (f) CAMERA — ONE continuous camera path for the whole clip (no cuts). MANDATORY in every CHARACTER beat unless env-only. Match pageContent shot size / angle AND the MOTION ENERGY tier from rule (c):
+       • mild / calm / reflective → ONE primary camera move: single micro-zoom OR single small angle drift OR static hold. You MAY pair a micro-zoom with a small angle drift if BOTH stay minimal (zoom ≤ ~5% AND angle drift ≤ ~5 degrees) — treat them as ONE combined gentle move. Do NOT add a third dimension; NO lateral track / pan in mild tier.
+       • tension / confrontation / dialogue with charged stakes → ONE or TWO dimensions combined; readable but still slow (zoom ≤ ~15%, angle drift ≤ ~10 degrees).
+       • rescue / chase / impact / outburst → up to TWO dimensions combined; can feel urgent (handheld-feel, slight organic shake, faster push, lateral track allowed).
+       Allowed primitives (combine up to TWO of {zoom/dolly, angle/height, lateral/track}; mild caps at zoom+angle only):
+       • ZOOM / DOLLY: "slow dolly-in from medium-wide to medium", "slow push-in toward the face", "slow pull-back from medium to medium-wide", "micro-zoom-in (~5% over the clip)", "micro-zoom-in (~10% over the clip)", "slow dolly-in tightening from waist-up to medium close-up".
+       • ANGLE / HEIGHT: "eye-level", "slight low-angle (5–15 degrees)", "high-angle wide", "over-the-shoulder from behind [role]", "camera drifts from eye-level to a 5-degree low-angle", "tilt down 5 degrees toward the hands".
+       • LATERAL / TRACK: "slow lateral pan-right", "slow truck-left following [role]'s movement", "slow quarter-orbit around the subject".
+       • HOLD: "static eye-level hold" — allowed when pageContent is a tight emotional close-up OR when the energy tier is mild and subject motion alone carries the shot. Still name angle (eye-level / low-angle / high-angle).
        FORBIDDEN camera language: jump-cut zoom, whip-pan, 360 spin, "cuts to new angle", rack focus between subjects, montage, cross-dissolve.
    (g) Ambient motion if appropriate — match pageContent setting only: "rain streaks down the window", "neon signage flickers", "leaves flutter in the breeze", "distant traffic blurs past", "dust motes drift in a sunbeam", "steam rises from a mug", "embers and smoke swirl", "holographic UI elements pulse".
-   (h) FORBIDDEN softeners on CHARACTER motion — WAN treats these as "frozen subject" and animates only camera + ambient: "subtle", "subtly", "barely", "imperceptible", "a fraction", "almost", "slight movement", "slightly", "gentle", "gently", "soft", "softly", "quietly", "faint", "faintest", "minimal", "minimally", "hushed", "delicate", "nearly motionless", "remains motionless", "stands still" (unless the SAME sentence also gives an explicit body-anchor verb with a measurable amount). Allowed: camera geometry ("slight low-angle", "micro push-in") and one short memory-grade / DoF clause per flashback beat (rule k).
+   (h) FORBIDDEN softeners on CHARACTER motion — WAN treats these as "frozen subject" and animates only camera + ambient: "subtle", "subtly", "barely", "imperceptible", "a fraction", "almost", "slight movement", "slightly", "gentle", "gently", "soft", "softly", "quiet", "quietly", "faint", "faintest", "minimal", "minimally", "hushed", "delicate", "nearly motionless", "remains motionless", "stands still" (unless the SAME sentence also gives an explicit body-anchor verb with a measurable amount: count "once", angle "5 degrees", distance "a centimetre", "half-step"). PREFER measurable mild words instead: "restrained", "polite", "small", "short", "single", "one", "one beat", "one half-step", "a touch", "about a centimetre", "5 degrees" — these are NOT softeners and animate cleanly. Allowed exceptions: camera geometry ("slight low-angle", "micro push-in", "static eye-level hold" — "static" is a CAMERA descriptor and NOT the same as character "stands still") and one short memory-grade / DoF clause per flashback beat (rule k).
    (i) ONE CONTINUOUS TAKE — WAN cannot cut, dissolve, or rack-focus across multiple subjects mid-clip. FORBIDDEN in motionPrompt: "montage", "cross-dissolve", "cuts to", "rack focus", "split screen", "then we cut to". Pick ONE primary action chain in ONE place; camera zoom/angle change must be one smooth path, not a new shot.
    (j) DIALOGUE beats (a character speaks): WAN cannot lipsync from text alone. Describe lips/mouth motion in clear speaking rhythm with body anchors (head bobs, breath, hand gesture), then APPEND at the end: "(lipsync polished in post)".
    (k) FLASHBACK beats: briefly carry the memory-grade register from pageContent into the motion clip (e.g. "cool desaturated memory grade with light grain", "sepia memory tone with vignette"). One short clause is enough.
@@ -506,7 +529,13 @@ _WAN_MOTION_PROMPT_RULES: str = """\
    STRUCTURE — write motionPrompt in this order, as ONE plain prose paragraph (no bullets):
      [subject action chain with concrete kinetic verbs + body anchors, plus interaction if multi-character] [one continuous camera path: zoom/dolly and/or angle/height and/or lateral track] [ambient motion if appropriate] [memory-grade tag if flashback] [Subject motion priority cue if a character is in frame] [duration + fps tag]
 
-   GOOD EXAMPLE (historical dialogue close-up):
+   GOOD EXAMPLE (mild reaction — restrained laugh / content nod, ANY genre):
+     "The monarch in imperial yellow hunting robes settles after his surprise; his lips part about a centimetre for one short exhale of restrained amusement, then close; his chin dips 5 degrees once and returns; his shoulders rise and fall once in a single short chuckle; the outer corners of his eyes crease without throwing his head back. Micro-zoom-in (~5% over the clip) while the angle eases from eye-level to a 5-degree low-angle, medium close-up. Golden leaves flutter in the crisp autumn air. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (mild reaction — modern setting):
+     "The barista in a green apron lifts the corners of her mouth into a small, polite smile; her chin tilts down 5 degrees once in acknowledgment; her right hand wraps around the cup handle in one steady motion, then her chest rises and falls in one short breath. Static eye-level hold, medium close-up. Steam rises from the cup, ceiling lights shimmer. Subject motion priority over camera; characters move clearly, not frozen. 5s, 24fps."
+
+   GOOD EXAMPLE (historical dialogue close-up — strong tier):
      "The official in dark blue robes slowly tilts his chin down 5 degrees in a deeper bow, holds for a beat, then lifts his chin a touch back up; the right corner of his mouth pulls upward into a sharp smirk while his eyes narrow with proud satisfaction; he inhales once, shoulders rising and falling; behind him the elderly monarch in soft-focus gives a clear single nod. Slow micro push-in, slight low-angle, medium close-up. Loose hair strands flutter in the breeze, leaves drift through the bokeh. Subject motion priority over camera; characters move clearly, not frozen. (lipsync polished in post) 5s, 24fps."
 
    GOOD EXAMPLE (modern office dialogue):
@@ -1127,6 +1156,17 @@ def _generate_with_transient_retry(
     return None
 
 
+def _sleep_vertex_planner_cooldown(seconds: float, *, detail: str) -> None:
+    """Nghỉ chủ động giữa các gọi planner lớn (giảm burst TPM / 429 trên Vertex)."""
+    if seconds <= 0:
+        return
+    print(
+        f"  · Nghỉ {seconds:g}s ({detail})...",
+        file=sys.stderr,
+    )
+    time.sleep(seconds)
+
+
 # ---- Image-call throttling + retry (chống 429 RESOURCE_EXHAUSTED trên Vertex) ----
 _IMAGE_MIN_INTERVAL_S: float = 0.0
 _IMAGE_RETRY_DELAYS: tuple[int, ...] = (30, 60, 120, 240, 480)
@@ -1342,15 +1382,17 @@ def _normalize_story_content(
     out_dir: Path,
     planner_model: str,
     regenerate: bool = False,
-    chunk_chars: int = 6000,
+    chunk_chars: int = 2200,
+    inter_chunk_sleep_sec: float = 12.0,
 ) -> str:
     """
     Sửa lỗi chính tả tiếng Việt + chuyển từ TIẾNG NƯỚC NGOÀI sang phiên âm THUẦN VIỆT (cách đọc),
     KHÔNG đổi nội dung / cấu trúc / xưng hô / dấu câu / xuống dòng. Lưu vào `out_dir / 'content_fix.txt'`
     cùng metadata `out_dir / 'content_fix.meta.json'`. Trả truyện đã chỉnh.
 
-    Truyện dài > `chunk_chars` ký tự được chia thành nhiều chunk, fix song song theo trình tự,
+    Truyện dài > `chunk_chars` ký tự được chia thành nhiều chunk, fix **tuần tự**,
     có retry transient + fallback từng chunk (dùng nguyên gốc nếu chunk đó fail).
+    Sau mỗi chunk thành công: `time.sleep(inter_chunk_sleep_sec)` trước chunk kế (giảm 429 TPM trên Vertex).
     """
     fix_path = out_dir / "content_fix.txt"
     meta_path = out_dir / "content_fix.meta.json"
@@ -1435,6 +1477,13 @@ def _normalize_story_content(
             continue
 
         fixed_parts.append(fixed_chunk)
+        if inter_chunk_sleep_sec > 0 and i < len(chunks) - 1:
+            print(
+                f"    · Nghỉ {inter_chunk_sleep_sec:g}s sau chunk {i + 1}/{len(chunks)} "
+                "(hạ tốc TPM trước chunk kế)...",
+                file=sys.stderr,
+            )
+            time.sleep(inter_chunk_sleep_sec)
 
     fixed = "".join(fixed_parts)
     if not fixed.strip():
@@ -1463,6 +1512,7 @@ def _normalize_story_content(
             "chunks_total": len(chunks),
             "chunks_failed_fallback": n_failed,
             "chunk_chars_target": chunk_chars,
+            "inter_chunk_sleep_sec": inter_chunk_sleep_sec,
         },
     )
     suffix_warn = (
@@ -1571,289 +1621,43 @@ def _row_section_number(row: dict[str, Any], fallback: int) -> int:
         return fallback
 
 
-def _split_review_two_pass(
-    client: genai.Client,
-    story: str,
+def _review_pass2_prev_tail_block_from_scenes(scenes_for_tail: list[Scene]) -> str:
+    """Khối PREVIOUS-SECTION TAIL cho prompt pass-2 (chỉ dựa trên các beat trước section hiện tại)."""
+    prev_tail_block = ""
+    if scenes_for_tail:
+        prev_present = next(
+            (
+                s
+                for s in reversed(scenes_for_tail)
+                if (s.narrative_plane or "present") == "present"
+            ),
+            None,
+        )
+        if prev_present is not None and prev_present.page_content:
+            prev_tail_block = (
+                "\nPREVIOUS-SECTION TAIL (for continuity check, DO NOT repeat as a beat in this section):\n"
+                f"- previousPresentBeatPageContent: {prev_present.page_content[:1200]}\n"
+                "- If the FIRST beat of THIS section continues the SAME continuous scene as that previous beat "
+                "(same location, same time-of-day window, same conversation/action chain — check the SECTION EXCERPT "
+                "below against the previous beat's wording), you MUST copy verbatim the location, lighting, time-of-day, "
+                "and each character's outfit/hair/grooming wording from the previous beat into this section's present beats. "
+                "Treat them as one continuous scene that just happened to be cut into two outline sections.\n"
+                "- Otherwise (real time/place jump or flashback), describe the new setting/wardrobe naturally per the prose."
+            )
+    return prev_tail_block
+
+
+def _build_review_pass2_beats_prompt(
     *,
-    char_paths: dict[str, Path],
-    style_paths: list[Path],
-    scene_count: int | None,
-    planner_model: str,
-    checkpoint_path: Path,
-    plan_manifest_path: Path | None = None,
-    bible_inline: bool = False,
-    bible_path: Path | None = None,
-    bible_regenerate: bool = False,
-) -> list[Scene]:
-    """
-    Review: bước 1 = dàn ý (ít object, không pageContent dài); bước 2 = beat chi tiết từng đoạn.
-    Ghi checkpoint sau outline và sau mỗi đoạn (để resume khi API lỗi).
-    """
-    story_fp = _story_fingerprint(story)
-    asset_list = _asset_list_for_prompt(char_paths, style_paths)
-    outline_clause = (
-        f"EXACTLY {scene_count} contiguous outline sections"
-        if scene_count
-        else (
-            "a moderate number of contiguous outline sections "
-            "(roughly 8–25 depending on length—fewer, larger sections for very long stories)"
-        )
-    )
-    exact_outline = (
-        f"IMPORTANT: You MUST output EXACTLY {scene_count} outline sections covering the full story in order.\n"
-        if scene_count
-        else ""
-    )
-    outline_prompt = f"""
-Task: Create a STORY OUTLINE for later illustration-beat planning (review / storyboard mode).
-You are NOT creating final illustration beats yet—only contiguous prose sections.
-
-Break the following story into {outline_clause} that cover the ENTIRE story from beginning to end.
-
-Story (full text):
-{story}
-
-Available Assets in Library: {json.dumps(asset_list, ensure_ascii=False)}
-
-{exact_outline}
-Rules:
-- Sections MUST be in chronological reading order, contiguous, no gaps, no overlaps.
-- Genre-agnostic: outline boundaries depend ONLY on explicit prose cues (time jump, location change, POV/memory shift),
-  not on story type (romance, thriller, sci-fi, children's, etc.).
-- Each section must be a single contiguous excerpt from the story (verbatim span).
-- Keep this output COMPACT: do NOT write pageContent / image prompts in this step.
-
-SECTION BOUNDARY RULES (CRITICAL — DO NOT BREAK A CONTINUOUS SCENE):
-- A "section" should correspond to ONE continuous on-screen scene = same location + same time-of-day window + same continuous chain of action / dialogue. If the story spends many paragraphs on one continuous scene, KEEP it as ONE section (do not split it just because it is long).
-- You MAY start a new section ONLY when the prose shows at least one of these clear breaks in the PRESENT timeline:
-  (a) explicit time jump in the present timeline (e.g. "the next morning", "three days later", "weeks passed", or any equivalent in the source language),
-  (b) explicit location change in the present timeline (characters physically move to a different place and the prose stays there),
-  (c) point-of-view / narrator shift in the PRESENT timeline (a brief recollection / dream is NOT a POV shift — see below).
-  (d) major narrative beat change clearly separated by a paragraph break + present-timeline time/space gap (NOT just a new dialogue turn, NOT a quick memory).
-- DO NOT split between adjacent sentences that share the same room, same conversation, same minute. Example BAD split: ending one section at "she handed him the divorce papers." and starting the next at "he flipped to the last page and signed it." — that is one continuous action and MUST stay in one section.
-- FLASHBACK / RECOLLECTION INSIDE A SCENE IS NOT A SECTION BREAK (CRITICAL):
-  • If a continuous present scene is interrupted by a brief flashback / recollection / dream / inner-monologue memory and then RETURNS to the same room / same conversation / same minute, the WHOLE thing (present-before + flashback + present-after) is ONE section.
-  • The pass-2 planner will tag the flashback prose with narrativePlane="flashback" and the surrounding prose with narrativePlane="present" — both belong to the SAME outline section here.
-  • Only treat the flashback as a SEPARATE section if the prose never returns to the original present scene (i.e. after the memory the story moves to a different place / time, never resuming the prior conversation).
-- If wardrobe / setting must remain identical across the next prose, that prose belongs to the SAME section.
-- Prefer fewer, larger sections over many small ones whenever the prose stays in one continuous scene.
-
-For each section output:
-1. sectionNumber: integer 1..N in order
-2. storySegment: one short line summarizing the section
-3. startAnchor: EXACT first 5–10 words as they appear in the story
-4. endAnchor: EXACT last 5–10 words as they appear in the story
-5. storyText: VERBATIM excerpt from the story from startAnchor through endAnchor inclusive
-
-Return ONLY a JSON array of objects with keys:
-"sectionNumber", "storySegment", "startAnchor", "endAnchor", "storyText".
-"""
-
-    def _section_sort_key(r: dict[str, Any]) -> int:
-        try:
-            return int(r.get("sectionNumber", 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def _persist(
-        outline: list[dict[str, Any]],
-        completed: set[int],
-        scenes_acc: list[Scene],
-    ) -> None:
-        _atomic_write_json(
-            checkpoint_path,
-            {
-                "version": 1,
-                "story_fp": story_fp,
-                "planner_model": planner_model,
-                "scene_count": scene_count,
-                "outline": outline,
-                "completed_section_numbers": sorted(completed),
-                "scenes": [scene_to_manifest_dict(s, "review") for s in scenes_acc],
-            },
-        )
-        outline_sidecar = checkpoint_path.parent / "review_outline.json"
-        _atomic_write_json(
-            outline_sidecar,
-            {
-                "version": 1,
-                "story_fp": story_fp,
-                "planner_model": planner_model,
-                "scene_count": scene_count,
-                "completed_section_numbers": sorted(completed),
-                "outline": outline,
-            },
-        )
-        if plan_manifest_path is not None:
-            _atomic_write_json(
-                plan_manifest_path,
-                [scene_to_manifest_dict(s, "review") for s in scenes_acc],
-            )
-
-    ck: dict[str, Any] | None = None
-    if checkpoint_path.is_file():
-        try:
-            ck = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            ck = None
-        if ck and ck.get("story_fp") != story_fp:
-            raise SystemExit(
-                f"Checkpoint {checkpoint_path} thuộc bản truyện khác. "
-                "Dùng --fresh-checkpoint để xóa và chạy lại, hoặc trỏ -o đúng thư mục cũ."
-            )
-        if ck and ck.get("planner_model") != planner_model:
-            print(
-                f"Cảnh báo: planner_model trong checkpoint ({ck.get('planner_model')!r}) "
-                f"khác lệnh hiện tại ({planner_model!r}).",
-                file=sys.stderr,
-            )
-
-    # Bible inline state (cập nhật sau mỗi section beats xong, persist ngay).
-    bible_state: dict[int, dict[str, Any]] = {}
-    if bible_inline and bible_path is not None:
-        bible_state = _load_section_designs_state(
-            bible_path,
-            story_fp,
-            regenerate=bible_regenerate,
-        )
-        if bible_state:
-            print(
-                f"Bible inline: load {len(bible_state)} section đã có từ {bible_path.name}.",
-                file=sys.stderr,
-            )
-
-    outline_sorted: list[dict[str, Any]]
-    completed_nums: set[int]
-    all_scenes: list[Scene]
-
-    if ck and isinstance(ck.get("outline"), list) and ck["outline"]:
-        outline_sorted = [r for r in ck["outline"] if isinstance(r, dict)]
-        outline_sorted.sort(key=_section_sort_key)
-        raw_done = ck.get("completed_section_numbers") or []
-        completed_nums = {int(x) for x in raw_done}
-        scenes_raw = ck.get("scenes") or []
-        all_scenes = [_manifest_dict_to_scene(d) for d in scenes_raw if isinstance(d, dict)]
-        n_fix = _dedupe_review_story_text_overlaps(all_scenes)
-        if n_fix:
-            print(
-                f"Đã chuẩn hoá storyText khi load checkpoint ({n_fix} cặp overlap).",
-                file=sys.stderr,
-            )
-            _persist(outline_sorted, completed_nums, all_scenes)
-        _warn_long_story_text_beats(all_scenes)
-        _propagate_copresent_cast_in_scenes(all_scenes)
-        print(
-            f"Tiếp tục từ checkpoint: {len(completed_nums)}/{len(outline_sorted)} đoạn dàn ý, "
-            f"{len(all_scenes)} beat.",
-            file=sys.stderr,
-        )
-    else:
-        def _outline_call() -> Any:
-            return client.models.generate_content(
-                model=planner_model,
-                contents=outline_prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.35,
-                ),
-            )
-
-        o_resp = _generate_with_transient_retry(
-            _outline_call, label=f"review outline (pass 1, {planner_model})"
-        )
-        if o_resp is None:
-            raise RuntimeError(
-                "Outline review (pass 1) gọi LLM thất bại sau nhiều retry. "
-                "Thử đổi --planner-model gemini-2.5-pro hoặc chạy lại sau."
-            )
-        outline_rows = _parse_planner_json_array(o_resp.text or "", client, planner_model)
-        outline_sorted = sorted(
-            [r for r in outline_rows if isinstance(r, dict)],
-            key=_section_sort_key,
-        )
-        if not outline_sorted:
-            raise ValueError("Outline review (pass 1) trả về rỗng.")
-        completed_nums = set()
-        all_scenes = []
-        _persist(outline_sorted, completed_nums, all_scenes)
-        print(
-            f"Đã lưu dàn ý ({len(outline_sorted)} đoạn) → {checkpoint_path}",
-            file=sys.stderr,
-        )
-
-    global_idx = len(all_scenes)
-
-    # Bible inline: nếu bible đã load có alias (vd. "Dr. Ôn") khác với tên thật trong char_paths
-    # thì sửa ngay để khớp với required_labels — tránh phải --regenerate-section-designs.
-    if bible_inline and bible_path is not None and bible_state and all_scenes:
-        sec_to_scenes_for_norm: dict[int, list[Scene]] = {}
-        for s in all_scenes:
-            if s.outline_section_number is not None:
-                sec_to_scenes_for_norm.setdefault(int(s.outline_section_number), []).append(s)
-        sec_to_required = {
-            sn: _required_character_labels_for_section(sec_to_scenes_for_norm[sn], char_paths)
-            for sn in bible_state.keys()
-            if sn in sec_to_scenes_for_norm
-        }
-        if sec_to_required:
-            _normalize_existing_bible_state_inplace(
-                bible_path,
-                existing=bible_state,
-                sec_to_required=sec_to_required,
-                char_paths=char_paths,
-                story_fp=story_fp,
-                planner_model=planner_model,
-            )
-            _repair_existing_bible_inplace(
-                bible_path,
-                client=client,
-                planner_model=planner_model,
-                existing=bible_state,
-                sec_to_required=sec_to_required,
-                char_paths=char_paths,
-                story_fp=story_fp,
-            )
-
-    for sec_i, row in enumerate(outline_sorted, start=1):
-        sec_num = _row_section_number(row, sec_i)
-        if sec_num in completed_nums:
-            continue
-
-        start_a = str(row.get("startAnchor", ""))
-        end_a = str(row.get("endAnchor", ""))
-        raw_chunk = str(row.get("storyText") or "").strip()
-        chunk = raw_chunk if raw_chunk else _verbatim_between_anchors(story, start_a, end_a)
-        chunk = (chunk or "").strip()
-        if not chunk:
-            print(
-                f"Cảnh báo outline section {sec_i}: không có đoạn văn; đánh dấu xong để không kẹt resume.",
-                file=sys.stderr,
-            )
-            completed_nums.add(sec_num)
-            _persist(outline_sorted, completed_nums, all_scenes)
-            continue
-
-        sec_summary_line = str(row.get("storySegment", "")).strip()
-
-        prev_tail_block = ""
-        if all_scenes:
-            prev_present = next(
-                (s for s in reversed(all_scenes) if (s.narrative_plane or "present") == "present"),
-                None,
-            )
-            if prev_present is not None and prev_present.page_content:
-                prev_tail_block = (
-                    "\nPREVIOUS-SECTION TAIL (for continuity check, DO NOT repeat as a beat in this section):\n"
-                    f"- previousPresentBeatPageContent: {prev_present.page_content[:1200]}\n"
-                    "- If the FIRST beat of THIS section continues the SAME continuous scene as that previous beat "
-                    "(same location, same time-of-day window, same conversation/action chain — check the SECTION EXCERPT "
-                    "below against the previous beat's wording), you MUST copy verbatim the location, lighting, time-of-day, "
-                    "and each character's outfit/hair/grooming wording from the previous beat into this section's present beats. "
-                    "Treat them as one continuous scene that just happened to be cut into two outline sections.\n"
-                    "- Otherwise (real time/place jump or flashback), describe the new setting/wardrobe naturally per the prose."
-                )
-
-        beats_prompt = f"""
+    asset_list: list[dict[str, str]],
+    n_outline_sections: int,
+    sec_i: int,
+    sec_summary_line: str,
+    chunk: str,
+    prev_tail_block: str,
+) -> str:
+    """Prompt pass-2 (beat) cho một section — dùng chung cho planner chính và backfill section thiếu."""
+    return f"""
 Task: Act as a Story Review / Visual Reading Artist (NOT manga multi-panel pages).
 Expand ONLY the following STORY SECTION into illustration beats. Each item is ONE standalone illustration.
 
@@ -1866,7 +1670,7 @@ SCOPE — GENRE & SOURCE LANGUAGE (apply to every story):
 - Worked examples below illustrate STRUCTURE (how to split beats), not tone/era/plot — never copy their wording.
 
 OUTLINE SECTION (this entire response is ONE section only):
-- sectionIndex: {sec_i} of {len(outline_sorted)} (reading order).
+- sectionIndex: {sec_i} of {n_outline_sections} (reading order).
 - sectionLabel: {sec_summary_line!r}
 - PRESENT-THREAD CONTINUITY (DEFINITION — applies to every "consecutive beats" rule below):
   • The "present thread" is the chain of beats with narrativePlane="present" inside this section, READ IN ORDER and IGNORING any flashback beats inserted between them. So if the section runs `present₁ → flashback → present₂ → present₃ → flashback → present₄`, the present thread is `present₁ → present₂ → present₃ → present₄`.
@@ -1971,6 +1775,12 @@ For each beat:
    This is a list of filenames from Available Assets for characters who are PHYSICALLY PRESENT in the beat's space — NOT for everyone who is merely mentioned.
    In pageContent, also write at the very end a single-line audit block:
      "WHO IS WHERE: SPEAKER → <name or 'narrator'>; LISTENERS PRESENT → <name>, <name>; OFF-FRAME but in scene → <name> (only if needed)."
+     For LISTENERS PRESENT: list each physically co-present person ONCE (do not repeat the SPEAKER if they are the only focal subject).
+   FLASHBACK BEATS (narrativePlane="flashback") — suggestedReferences MUST follow the MEMORY FRAME ONLY:
+   • The flashback image is a different time/place from the surrounding "present" thread. suggestedReferences MUST include ONLY characters who are VISIBLY SHOWN or explicitly co-present INSIDE THIS recalled scene (exactly as in THIS beat's pageContent + WHO IS WHERE).
+   • DO NOT add characters who belong only to the outer present-day scene (e.g. emperor / generals / hunt companions in the current royal hunt) unless they literally appear as figures inside THIS memory frame.
+   • If pageContent describes only two people in the memory room, suggestedReferences MUST be ONLY those two matching filenames — never pad with present-thread cast "because the section has them".
+   • If the prose names someone not drawn in the memory image, do NOT add their ref; express them as dialogue/memory text only, not as an extra ref.
    MUST INCLUDE (add the filename to suggestedReferences):
      • The SPEAKER of this beat (if they have a ref).
      • Anyone LISTENING / standing nearby / sitting in the same enclosed or open space (room, hallway, hall, courtyard, plaza, cabin, vehicle, hospital ward, cave, spaceship deck, etc.) — even silent and not the focal subject.
@@ -1996,6 +1806,657 @@ Return ONLY a JSON array with keys (EVERY object MUST contain ALL 10 keys, inclu
 "pageNumber", "storySegment", "startAnchor", "endAnchor", "storyText", "pageContent", "panelCount", "suggestedReferences", "narrativePlane", "motionPrompt".
 Number pageNumber starting at 1 within this section (it will be renumbered).
 """
+
+
+def _insertion_index_for_outlined_section(sorted_scenes: list[Scene], sec_num: int) -> int:
+    """Chèn beat của outline section `sec_num` ngay sau beat cuối có outlineSectionNumber < sec_num."""
+    last_below = -1
+    for i, sc in enumerate(sorted_scenes):
+        osn = getattr(sc, "outline_section_number", None)
+        if osn is None:
+            continue
+        if int(osn) < int(sec_num):
+            last_below = i
+    return last_below + 1
+
+
+def _persist_review_two_pass_data(
+    *,
+    checkpoint_path: Path,
+    plan_manifest_path: Path | None,
+    story_fp: str,
+    planner_model: str,
+    scene_count: int | None,
+    outline_sorted: list[dict[str, Any]],
+    completed: set[int],
+    scenes_acc: list[Scene],
+) -> None:
+    """Ghi review_two_pass.json + review_outline.json + scenes.json (cùng cấu trúc _split_review_two_pass._persist)."""
+    _atomic_write_json(
+        checkpoint_path,
+        {
+            "version": 1,
+            "story_fp": story_fp,
+            "planner_model": planner_model,
+            "scene_count": scene_count,
+            "outline": outline_sorted,
+            "completed_section_numbers": sorted(completed),
+            "scenes": [scene_to_manifest_dict(s, "review") for s in scenes_acc],
+        },
+    )
+    outline_sidecar = checkpoint_path.parent / "review_outline.json"
+    _atomic_write_json(
+        outline_sidecar,
+        {
+            "version": 1,
+            "story_fp": story_fp,
+            "planner_model": planner_model,
+            "scene_count": scene_count,
+            "completed_section_numbers": sorted(completed),
+            "outline": outline_sorted,
+        },
+    )
+    if plan_manifest_path is not None:
+        _atomic_write_json(
+            plan_manifest_path,
+            [scene_to_manifest_dict(s, "review") for s in scenes_acc],
+        )
+
+
+def _backfill_missing_outline_sections_in_review_checkpoint(
+    client: genai.Client,
+    story: str,
+    *,
+    checkpoint_path: Path,
+    plan_manifest_path: Path | None,
+    char_paths: dict[str, Path],
+    style_paths: list[Path],
+    planner_model: str,
+    planner_sleep_sec: float,
+    bible_inline: bool = False,
+    bible_path: Path | None = None,
+    bible_regenerate: bool = False,
+) -> int:
+    """
+    Dàn ý (outline) có sectionNumber nhưng không có beat nào mang outlineSectionNumber tương ứng
+    → gọi lại pass-2 planner cho từng section thiếu, chèn beat đúng chỗ trong timeline, đánh số lại pageNumber.
+    Trả về số section đã bù thành công.
+    """
+    if not checkpoint_path.is_file():
+        return 0
+    try:
+        ck: dict[str, Any] = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return 0
+    if not isinstance(ck, dict):
+        return 0
+    story_fp = _story_fingerprint(story)
+    if ck.get("story_fp") != story_fp:
+        print(
+            f"  [WARN] Bù beat section thiếu: story_fp checkpoint khác truyện hiện tại — bỏ qua.",
+            file=sys.stderr,
+        )
+        return 0
+
+    outline_raw = ck.get("outline") or []
+    if not isinstance(outline_raw, list) or not outline_raw:
+        return 0
+    outline_sorted = [r for r in outline_raw if isinstance(r, dict)]
+    outline_sorted.sort(key=lambda r: _row_section_number(r, 0))
+    scenes_raw = ck.get("scenes") or []
+    all_scenes = [_manifest_dict_to_scene(d) for d in scenes_raw if isinstance(d, dict)]
+    raw_done = ck.get("completed_section_numbers") or []
+    completed_nums = {int(x) for x in raw_done}
+    scene_count = ck.get("scene_count")
+    if scene_count is not None:
+        try:
+            scene_count = int(scene_count)
+        except (TypeError, ValueError):
+            scene_count = None
+
+    outline_nums: set[int] = set()
+    for j, r in enumerate(outline_sorted, start=1):
+        outline_nums.add(_row_section_number(r, j))
+    secs_from_beats = {
+        int(s.outline_section_number)
+        for s in all_scenes
+        if getattr(s, "outline_section_number", None) is not None
+    }
+    missing = sorted(outline_nums - secs_from_beats)
+    if not missing:
+        return 0
+
+    asset_list = _asset_list_for_prompt(char_paths, style_paths)
+    bible_state: dict[int, dict[str, Any]] = {}
+    if bible_inline and bible_path is not None:
+        bible_state = _load_section_designs_state(
+            bible_path,
+            story_fp,
+            regenerate=bible_regenerate,
+        )
+
+    n_ok = 0
+    for sec_num in missing:
+        row: dict[str, Any] | None = None
+        sec_i = 0
+        for j, r in enumerate(outline_sorted, start=1):
+            if not isinstance(r, dict):
+                continue
+            if _row_section_number(r, j) == sec_num:
+                row = r
+                sec_i = j
+                break
+        if row is None:
+            print(
+                f"  [WARN] Bù beat: không tìm thấy outline row cho section {sec_num:02d}.",
+                file=sys.stderr,
+            )
+            continue
+
+        start_a = str(row.get("startAnchor", ""))
+        end_a = str(row.get("endAnchor", ""))
+        raw_chunk = str(row.get("storyText") or "").strip()
+        chunk = raw_chunk if raw_chunk else _verbatim_between_anchors(story, start_a, end_a)
+        chunk = (chunk or "").strip()
+        if not chunk:
+            print(
+                f"  [WARN] Bù beat section {sec_num:02d}: không có đoạn văn (storyText/anchor) — bỏ qua.",
+                file=sys.stderr,
+            )
+            continue
+
+        sec_summary_line = str(row.get("storySegment", "")).strip()
+        ordered = sorted(all_scenes, key=lambda s: s.page_number)
+        insert_at = _insertion_index_for_outlined_section(ordered, sec_num)
+        prev_tail_block = _review_pass2_prev_tail_block_from_scenes(ordered[:insert_at])
+        beats_prompt = _build_review_pass2_beats_prompt(
+            asset_list=asset_list,
+            n_outline_sections=len(outline_sorted),
+            sec_i=sec_i,
+            sec_summary_line=sec_summary_line,
+            chunk=chunk,
+            prev_tail_block=prev_tail_block,
+        )
+
+        def _beats_call() -> Any:
+            return client.models.generate_content(
+                model=planner_model,
+                contents=beats_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.4,
+                ),
+            )
+
+        b_resp = _generate_with_transient_retry(
+            _beats_call,
+            label=f"review beats BACKFILL section {sec_num:02d} ({planner_model})",
+        )
+        if b_resp is None:
+            print(
+                f"  [WARN] Bù beat section {sec_num:02d}: LLM thất bại sau retry — bỏ qua.",
+                file=sys.stderr,
+            )
+            continue
+        beats_data = _parse_planner_json_array(b_resp.text or "", client, planner_model)
+        chunk_scenes = _manifest_rows_to_scenes(beats_data, story, "review")
+        if not chunk_scenes:
+            print(
+                f"  [WARN] Bù beat section {sec_num:02d}: planner trả rỗng / không parse được — bỏ qua.",
+                file=sys.stderr,
+            )
+            continue
+
+        new_block: list[Scene] = []
+        for s in chunk_scenes:
+            new_block.append(
+                Scene(
+                    page_number=0,
+                    story_segment=s.story_segment,
+                    start_anchor=s.start_anchor,
+                    end_anchor=s.end_anchor,
+                    page_content=s.page_content,
+                    story_text=s.story_text,
+                    panel_count=s.panel_count,
+                    suggested_references=s.suggested_references,
+                    panels=s.panels,
+                    narrative_plane=s.narrative_plane,
+                    outline_section_number=sec_num,
+                    outline_section_summary=sec_summary_line,
+                    motion_prompt=s.motion_prompt,
+                )
+            )
+        ordered[insert_at:insert_at] = new_block
+        for i, sc in enumerate(ordered, start=1):
+            sc.page_number = i
+        all_scenes = ordered
+        completed_nums.add(sec_num)
+
+        _dedupe_review_story_text_overlaps(all_scenes)
+        if _propagate_copresent_cast_in_scenes(all_scenes):
+            pass
+        _persist_review_two_pass_data(
+            checkpoint_path=checkpoint_path,
+            plan_manifest_path=plan_manifest_path,
+            story_fp=story_fp,
+            planner_model=planner_model,
+            scene_count=scene_count,
+            outline_sorted=outline_sorted,
+            completed=completed_nums,
+            scenes_acc=all_scenes,
+        )
+        print(
+            f"  · Đã bù beat outline section {sec_num:02d}: +{len(new_block)} beat "
+            f"(tổng {len(all_scenes)}); checkpoint đã lưu.",
+            file=sys.stderr,
+        )
+        n_ok += 1
+
+        if bible_inline and bible_path is not None and sec_num not in bible_state:
+            this_section_scenes = [
+                s
+                for s in all_scenes
+                if getattr(s, "outline_section_number", None) is not None
+                and int(s.outline_section_number) == int(sec_num)
+            ]
+            if this_section_scenes:
+                if planner_sleep_sec > 0:
+                    _sleep_vertex_planner_cooldown(
+                        min(8.0, planner_sleep_sec * 0.5),
+                        detail=f"TPM — sau bù beat section {sec_num:02d}, trước Wardrobe Bible inline",
+                    )
+                obj, required_labels = _plan_one_section_wardrobe_bible(
+                    client=client,
+                    planner_model=planner_model,
+                    sec_num=sec_num,
+                    sec_scenes=this_section_scenes,
+                    section_summary=sec_summary_line,
+                    char_paths=char_paths,
+                    prev_design=_previous_section_design_for_bible(bible_state, sec_num),
+                    planner_sleep_sec=planner_sleep_sec,
+                )
+                if obj is not None:
+                    bible_state[sec_num] = obj
+                    _persist_section_designs(
+                        bible_path,
+                        story_fp=story_fp,
+                        planner_model=planner_model,
+                        existing=bible_state,
+                    )
+                    n_chars = (
+                        len((obj.get("characters") or {}).keys())
+                        if isinstance(obj.get("characters"), dict)
+                        else 0
+                    )
+                    print(
+                        f"  · Bible inline sau bù section {sec_num:02d}: lưu ({n_chars} character).",
+                        file=sys.stderr,
+                    )
+
+        if planner_sleep_sec > 0 and sec_num != missing[-1]:
+            _sleep_vertex_planner_cooldown(
+                planner_sleep_sec,
+                detail="TPM — sau bù beat một section, trước section thiếu kế",
+            )
+
+    return n_ok
+
+
+def _split_review_two_pass(
+    client: genai.Client,
+    story: str,
+    *,
+    char_paths: dict[str, Path],
+    style_paths: list[Path],
+    scene_count: int | None,
+    planner_model: str,
+    checkpoint_path: Path,
+    plan_manifest_path: Path | None = None,
+    bible_inline: bool = False,
+    bible_path: Path | None = None,
+    bible_regenerate: bool = False,
+    planner_sleep_sec: float = 10.0,
+) -> list[Scene]:
+    """
+    Review: bước 1 = dàn ý (ít object, không pageContent dài); bước 2 = beat chi tiết từng đoạn.
+    Ghi checkpoint sau outline và sau mỗi đoạn (để resume khi API lỗi).
+    """
+    story_fp = _story_fingerprint(story)
+    asset_list = _asset_list_for_prompt(char_paths, style_paths)
+    outline_clause = (
+        f"EXACTLY {scene_count} contiguous outline sections"
+        if scene_count
+        else (
+            "a moderate number of contiguous outline sections "
+            "(roughly 8–25 depending on length—fewer, larger sections for very long stories)"
+        )
+    )
+    exact_outline = (
+        f"IMPORTANT: You MUST output EXACTLY {scene_count} outline sections covering the full story in order.\n"
+        if scene_count
+        else ""
+    )
+    outline_prompt = f"""
+Task: Create a STORY OUTLINE for later illustration-beat planning (review / storyboard mode).
+You are NOT creating final illustration beats yet—only contiguous prose sections.
+
+Break the following story into {outline_clause} that cover the ENTIRE story from beginning to end.
+
+Story (full text):
+{story}
+
+Available Assets in Library: {json.dumps(asset_list, ensure_ascii=False)}
+
+{exact_outline}
+Rules:
+- Sections MUST be in chronological reading order, contiguous, no gaps, no overlaps.
+- Genre-agnostic: outline boundaries depend ONLY on explicit prose cues (time jump, location change, POV/memory shift),
+  not on story type (romance, thriller, sci-fi, children's, etc.).
+- Each section must be a single contiguous excerpt from the story (verbatim span).
+- Keep this output COMPACT: do NOT write pageContent / image prompts in this step.
+
+SECTION BOUNDARY RULES (CRITICAL — DO NOT BREAK A CONTINUOUS SCENE):
+- A "section" should correspond to ONE continuous on-screen scene = same location + same time-of-day window + same continuous chain of action / dialogue. If the story spends many paragraphs on one continuous scene, KEEP it as ONE section (do not split it just because it is long).
+- You MAY start a new section ONLY when the prose shows at least one of these clear breaks in the PRESENT timeline:
+  (a) explicit time jump in the present timeline (e.g. "the next morning", "three days later", "weeks passed", or any equivalent in the source language),
+  (b) explicit location change in the present timeline (characters physically move to a different place and the prose stays there),
+  (c) point-of-view / narrator shift in the PRESENT timeline (a brief recollection / dream is NOT a POV shift — see below).
+  (d) major narrative beat change clearly separated by a paragraph break + present-timeline time/space gap (NOT just a new dialogue turn, NOT a quick memory).
+- DO NOT split between adjacent sentences that share the same room, same conversation, same minute. Example BAD split: ending one section at "she handed him the divorce papers." and starting the next at "he flipped to the last page and signed it." — that is one continuous action and MUST stay in one section.
+- FLASHBACK / RECOLLECTION INSIDE A SCENE IS NOT A SECTION BREAK (CRITICAL):
+  • If a continuous present scene is interrupted by a brief flashback / recollection / dream / inner-monologue memory and then RETURNS to the same room / same conversation / same minute, the WHOLE thing (present-before + flashback + present-after) is ONE section.
+  • The pass-2 planner will tag the flashback prose with narrativePlane="flashback" and the surrounding prose with narrativePlane="present" — both belong to the SAME outline section here.
+  • Only treat the flashback as a SEPARATE section if the prose never returns to the original present scene (i.e. after the memory the story moves to a different place / time, never resuming the prior conversation).
+- If wardrobe / setting must remain identical across the next prose, that prose belongs to the SAME section.
+- Prefer fewer, larger sections over many small ones whenever the prose stays in one continuous scene.
+
+ANCHOR + storyText INTEGRITY (CRITICAL — automated resume depends on this):
+- startAnchor, endAnchor, and storyText MUST be produced ONLY by COPY-PASTING contiguous text from the "Story (full text)" block above. ZERO paraphrase, ZERO invented dialogue, ZERO "close enough" synonyms, ZERO merged quotes from memory.
+- Before you output the JSON: mentally (or step-by-step) VERIFY each section:
+  (1) startAnchor appears EXACTLY as a substring in the Story (same characters, same punctuation, same quotation marks as in the source — if the story uses curly quotes “ ” or ' ', copy those; if ASCII \" copy ASCII).
+  (2) endAnchor appears EXACTLY as a substring in the Story AFTER the first occurrence of startAnchor (same strict verbatim rules).
+  (3) storyText is NON-EMPTY and equals the contiguous Story substring from the first character of startAnchor through the LAST character of endAnchor inclusive (no omissions, no extra words). If you cannot satisfy (1)-(3), you MUST adjust anchors/storyText until you can — do NOT emit a section with mismatched anchors.
+- endAnchor must be the TRUE closing phrase of that section's excerpt as printed in the Story — NOT a different speaker line, NOT a summary phrase, NOT a line from another chapter/scene that "sounds similar".
+- If two candidate phrases look alike (e.g. two goodnight lines to different addressees), pick the one that ACTUALLY appears in order after startAnchor in this section's span; never substitute the wrong line.
+- Prefer anchors long enough (often 8–14 words, or a full short sentence) to be UNIQUE in the document; if 5–10 words collide elsewhere, extend until unique while still verbatim.
+- storyText is MANDATORY for every section: never omit the key; never return empty string; it is the single source of truth for the span (downstream code may fall back to anchors only when storyText is missing — avoid that by always filling storyText).
+
+For each section output:
+1. sectionNumber: integer 1..N in order
+2. storySegment: one short line summarizing the section
+3. startAnchor: EXACT first 5–14 words (or one short verbatim clause) as COPY-PASTED from the Story — must be a literal substring of the Story
+4. endAnchor: EXACT last 5–14 words (or one short verbatim clause) as COPY-PASTED from the Story — must be a literal substring appearing after startAnchor
+5. storyText: MANDATORY — the FULL contiguous VERBATIM excerpt from the Story from the first character of startAnchor through the last character of endAnchor inclusive (must match Story exactly; same rules as pass-2 beats)
+
+Return ONLY a JSON array of objects with keys:
+"sectionNumber", "storySegment", "startAnchor", "endAnchor", "storyText".
+"""
+
+    def _section_sort_key(r: dict[str, Any]) -> int:
+        try:
+            return int(r.get("sectionNumber", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _persist(
+        outline: list[dict[str, Any]],
+        completed: set[int],
+        scenes_acc: list[Scene],
+    ) -> None:
+        _persist_review_two_pass_data(
+            checkpoint_path=checkpoint_path,
+            plan_manifest_path=plan_manifest_path,
+            story_fp=story_fp,
+            planner_model=planner_model,
+            scene_count=scene_count,
+            outline_sorted=outline,
+            completed=completed,
+            scenes_acc=scenes_acc,
+        )
+
+    ck: dict[str, Any] | None = None
+    if checkpoint_path.is_file():
+        try:
+            ck = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            ck = None
+        if ck and ck.get("story_fp") != story_fp:
+            raise SystemExit(
+                f"Checkpoint {checkpoint_path} thuộc bản truyện khác. "
+                "Dùng --fresh-checkpoint để xóa và chạy lại, hoặc trỏ -o đúng thư mục cũ."
+            )
+        if ck and ck.get("planner_model") != planner_model:
+            print(
+                f"Cảnh báo: planner_model trong checkpoint ({ck.get('planner_model')!r}) "
+                f"khác lệnh hiện tại ({planner_model!r}).",
+                file=sys.stderr,
+            )
+
+    # Bible inline state (cập nhật sau mỗi section beats xong, persist ngay).
+    bible_state: dict[int, dict[str, Any]] = {}
+    if bible_inline and bible_path is not None:
+        bible_state = _load_section_designs_state(
+            bible_path,
+            story_fp,
+            regenerate=bible_regenerate,
+        )
+        if bible_state:
+            keys = ", ".join(f"{k:02d}" for k in sorted(bible_state.keys()))
+            print(
+                f"Bible inline: load {len(bible_state)} mục bible (section {keys}) từ {bible_path.name}.",
+                file=sys.stderr,
+            )
+
+    outline_sorted: list[dict[str, Any]]
+    completed_nums: set[int]
+    all_scenes: list[Scene]
+
+    if ck and isinstance(ck.get("outline"), list) and ck["outline"]:
+        outline_sorted = [r for r in ck["outline"] if isinstance(r, dict)]
+        outline_sorted.sort(key=_section_sort_key)
+        raw_done = ck.get("completed_section_numbers") or []
+        completed_nums = {int(x) for x in raw_done}
+        scenes_raw = ck.get("scenes") or []
+        all_scenes = [_manifest_dict_to_scene(d) for d in scenes_raw if isinstance(d, dict)]
+
+        _n_bf_ck = _backfill_missing_outline_sections_in_review_checkpoint(
+            client,
+            story,
+            checkpoint_path=checkpoint_path,
+            plan_manifest_path=plan_manifest_path,
+            char_paths=char_paths,
+            style_paths=style_paths,
+            planner_model=planner_model,
+            planner_sleep_sec=planner_sleep_sec,
+            bible_inline=bible_inline,
+            bible_path=bible_path,
+            bible_regenerate=bible_regenerate,
+        )
+        if _n_bf_ck > 0:
+            try:
+                ck = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                ck = None
+            if isinstance(ck, dict):
+                scenes_raw = ck.get("scenes") or []
+                all_scenes = [
+                    _manifest_dict_to_scene(d) for d in scenes_raw if isinstance(d, dict)
+                ]
+                raw_done = ck.get("completed_section_numbers") or []
+                completed_nums = {int(x) for x in raw_done}
+
+        n_fix = _dedupe_review_story_text_overlaps(all_scenes)
+        if n_fix:
+            print(
+                f"Đã chuẩn hoá storyText khi load checkpoint ({n_fix} cặp overlap).",
+                file=sys.stderr,
+            )
+            _persist(outline_sorted, completed_nums, all_scenes)
+        _warn_long_story_text_beats(all_scenes)
+        _propagate_copresent_cast_in_scenes(all_scenes)
+        print(
+            f"Tiếp tục từ checkpoint: {len(completed_nums)}/{len(outline_sorted)} đoạn dàn ý, "
+            f"{len(all_scenes)} beat.",
+            file=sys.stderr,
+        )
+    else:
+        def _outline_call() -> Any:
+            return client.models.generate_content(
+                model=planner_model,
+                contents=outline_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.35,
+                ),
+            )
+
+        o_resp = _generate_with_transient_retry(
+            _outline_call, label=f"review outline (pass 1, {planner_model})"
+        )
+        if o_resp is None:
+            raise RuntimeError(
+                "Outline review (pass 1) gọi LLM thất bại sau nhiều retry. "
+                "Thử đổi --planner-model gemini-2.5-pro hoặc chạy lại sau."
+            )
+        outline_rows = _parse_planner_json_array(o_resp.text or "", client, planner_model)
+        outline_sorted = sorted(
+            [r for r in outline_rows if isinstance(r, dict)],
+            key=_section_sort_key,
+        )
+        if not outline_sorted:
+            raise ValueError("Outline review (pass 1) trả về rỗng.")
+        completed_nums = set()
+        all_scenes = []
+        _persist(outline_sorted, completed_nums, all_scenes)
+        print(
+            f"Đã lưu dàn ý ({len(outline_sorted)} đoạn) → {checkpoint_path}",
+            file=sys.stderr,
+        )
+        _sleep_vertex_planner_cooldown(
+            planner_sleep_sec,
+            detail="TPM — sau outline review (pass 1), trước pass beat từng section",
+        )
+
+    global_idx = len(all_scenes)
+
+    # Bible inline: nếu bible đã load có alias (vd. "Dr. Ôn") khác với tên thật trong char_paths
+    # thì sửa ngay để khớp với required_labels — tránh phải --regenerate-section-designs.
+    if bible_inline and bible_path is not None and bible_state and all_scenes:
+        sec_to_scenes_for_norm: dict[int, list[Scene]] = {}
+        for s in all_scenes:
+            if s.outline_section_number is not None:
+                sec_to_scenes_for_norm.setdefault(int(s.outline_section_number), []).append(s)
+        sec_to_required = {
+            sn: _required_character_labels_for_section(sec_to_scenes_for_norm[sn], char_paths)
+            for sn in bible_state.keys()
+            if sn in sec_to_scenes_for_norm
+        }
+        if sec_to_required:
+            _normalize_existing_bible_state_inplace(
+                bible_path,
+                existing=bible_state,
+                sec_to_required=sec_to_required,
+                char_paths=char_paths,
+                story_fp=story_fp,
+                planner_model=planner_model,
+            )
+            _repair_existing_bible_inplace(
+                bible_path,
+                client=client,
+                planner_model=planner_model,
+                existing=bible_state,
+                sec_to_required=sec_to_required,
+                char_paths=char_paths,
+                story_fp=story_fp,
+            )
+
+    for sec_i, row in enumerate(outline_sorted, start=1):
+        sec_num = _row_section_number(row, sec_i)
+        if sec_num in completed_nums:
+            this_section_scenes = [
+                s
+                for s in all_scenes
+                if s.outline_section_number is not None
+                and int(s.outline_section_number) == int(sec_num)
+            ]
+            if this_section_scenes:
+                # Resume: beat đã có nhưng bible có thể chưa lưu (429 trước đó). Bù ngay khi duyệt tới dòng outline
+                # của section này — không chờ hết 27 section hay gap-fill cuối hàm.
+                if bible_inline and bible_path is not None and sec_num not in bible_state:
+                    resume_summary = str(row.get("storySegment", "")).strip()
+                    if planner_sleep_sec > 0:
+                        _sleep_vertex_planner_cooldown(
+                            min(8.0, planner_sleep_sec * 0.5),
+                            detail=(
+                                f"TPM — trước Wardrobe Bible bù section {sec_num:02d} "
+                                "(đã có beat, resume)"
+                            ),
+                        )
+                    obj, required_labels = _plan_one_section_wardrobe_bible(
+                        client=client,
+                        planner_model=planner_model,
+                        sec_num=sec_num,
+                        sec_scenes=this_section_scenes,
+                        section_summary=resume_summary,
+                        char_paths=char_paths,
+                        prev_design=_previous_section_design_for_bible(bible_state, sec_num),
+                        planner_sleep_sec=planner_sleep_sec,
+                    )
+                    if obj is not None:
+                        bible_state[sec_num] = obj
+                        _persist_section_designs(
+                            bible_path,
+                            story_fp=story_fp,
+                            planner_model=planner_model,
+                            existing=bible_state,
+                        )
+                        n_chars = (
+                            len((obj.get("characters") or {}).keys())
+                            if isinstance(obj.get("characters"), dict)
+                            else 0
+                        )
+                        if _wardrobe_bible_missing_details(obj, required_labels):
+                            print(
+                                f"  · Bible bù section {sec_num:02d} (resume): lưu ({n_chars} character) — kiểm tra outfit/hair.",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                f"  · Bible bù section {sec_num:02d} (resume): lưu ({n_chars} character, đủ outfit+hair).",
+                                file=sys.stderr,
+                            )
+                continue
+            print(
+                f"Checkpoint: section {sec_num:02d} trong completed_section_numbers nhưng không có beat "
+                f"(outlineSectionNumber) — chạy lại pass-2 cho section này.",
+                file=sys.stderr,
+            )
+
+        start_a = str(row.get("startAnchor", ""))
+        end_a = str(row.get("endAnchor", ""))
+        raw_chunk = str(row.get("storyText") or "").strip()
+        chunk = raw_chunk if raw_chunk else _verbatim_between_anchors(story, start_a, end_a)
+        chunk = (chunk or "").strip()
+        if not chunk:
+            print(
+                f"Cảnh báo outline section {sec_i}: không có đoạn văn; đánh dấu xong để không kẹt resume.",
+                file=sys.stderr,
+            )
+            completed_nums.add(sec_num)
+            _persist(outline_sorted, completed_nums, all_scenes)
+            continue
+
+        sec_summary_line = str(row.get("storySegment", "")).strip()
+
+        prev_tail_block = _review_pass2_prev_tail_block_from_scenes(all_scenes)
+        beats_prompt = _build_review_pass2_beats_prompt(
+            asset_list=asset_list,
+            n_outline_sections=len(outline_sorted),
+            sec_i=sec_i,
+            sec_summary_line=sec_summary_line,
+            chunk=chunk,
+            prev_tail_block=prev_tail_block,
+        )
 
         def _beats_call() -> Any:
             return client.models.generate_content(
@@ -2045,6 +2506,19 @@ Number pageNumber starting at 1 within this section (it will be renumbered).
             file=sys.stderr,
         )
 
+        this_for_bible = [s for s in all_scenes if s.outline_section_number == sec_num]
+        will_run_inline_bible = (
+            bible_inline
+            and bible_path is not None
+            and sec_num not in bible_state
+            and bool(this_for_bible)
+        )
+        if planner_sleep_sec > 0 and will_run_inline_bible:
+            _sleep_vertex_planner_cooldown(
+                min(8.0, planner_sleep_sec * 0.5),
+                detail="TPM — sau beat planner section, trước Wardrobe Bible inline",
+            )
+
         # Bible inline: ngay sau khi section beats xong + persist, plan luôn bible cho section này.
         if bible_inline and bible_path is not None and sec_num not in bible_state:
             this_section_scenes = [
@@ -2058,7 +2532,8 @@ Number pageNumber starting at 1 within this section (it will be renumbered).
                     sec_scenes=this_section_scenes,
                     section_summary=outline_summary,
                     char_paths=char_paths,
-                    prev_design=bible_state.get(sec_num - 1),
+                    prev_design=_previous_section_design_for_bible(bible_state, sec_num),
+                    planner_sleep_sec=planner_sleep_sec,
                 )
                 if obj is not None:
                     bible_state[sec_num] = obj
@@ -2083,6 +2558,30 @@ Number pageNumber starting at 1 within this section (it will be renumbered).
                             f"  · Bible inline section {sec_num:02d}: lưu ({n_chars} character, đủ outfit+hair).",
                             file=sys.stderr,
                         )
+
+        pending_sections = sum(
+            1
+            for j, r in enumerate(outline_sorted, start=1)
+            if _row_section_number(r, j) not in completed_nums
+        )
+        if planner_sleep_sec > 0 and pending_sections > 0:
+            _sleep_vertex_planner_cooldown(
+                planner_sleep_sec,
+                detail="TPM — review 2-pass, trước section planner kế",
+            )
+
+    # Lần 2 (cuối vòng for): bắt section bible inline vừa lỗi / None trong lúc chạy.
+    if bible_inline and bible_path is not None and all_scenes:
+        bible_state = _fill_missing_section_designs(
+            client=client,
+            planner_model=planner_model,
+            story_fp=story_fp,
+            bible_path=bible_path,
+            scenes=all_scenes,
+            char_paths=char_paths,
+            existing=bible_state,
+            planner_sleep_sec=planner_sleep_sec,
+        )
 
     n_fix = _dedupe_review_story_text_overlaps(all_scenes)
     if n_fix:
@@ -2113,6 +2612,7 @@ def split_story_into_scenes(
     bible_inline: bool = False,
     bible_path: Path | None = None,
     bible_regenerate: bool = False,
+    planner_sleep_sec: float = 10.0,
 ) -> list[Scene]:
     """
     Tách truyện: storybook = một minh họa / section; review = nhiều beat hình ảnh nhỏ (mỗi beat một ảnh);
@@ -2137,6 +2637,7 @@ def split_story_into_scenes(
             bible_inline=bible_inline,
             bible_path=bible_path,
             bible_regenerate=bible_regenerate,
+            planner_sleep_sec=planner_sleep_sec,
         )
 
     asset_list = _asset_list_for_prompt(char_paths, style_paths)
@@ -2312,6 +2813,10 @@ For each beat, define:
    This is a list of filenames from Available Assets for characters PHYSICALLY PRESENT in the beat — NOT for everyone merely mentioned.
    In pageContent, also write at the very end a single-line audit block:
      "WHO IS WHERE: SPEAKER → <name or 'narrator'>; LISTENERS PRESENT → <name>, <name>; OFF-FRAME but in scene → <name> (only if needed)."
+     For LISTENERS PRESENT: each physically co-present person ONCE (do not repeat the SPEAKER as listener if they are the sole speaker in frame).
+   FLASHBACK BEATS (narrativePlane="flashback") — suggestedReferences = MEMORY FRAME ONLY:
+   • Include ONLY characters visibly depicted or explicitly co-present INSIDE this recalled scene (this beat's pageContent + WHO IS WHERE). NEVER add present-thread-only cast (current hunt, throne room, etc.) unless they literally appear inside THIS memory image.
+   • If only two people appear in the flashback room, suggestedReferences MUST be exactly those two filenames — do not pad with section-wide cast.
    MUST INCLUDE:
      • The SPEAKER of this beat (if they have a ref).
      • Anyone LISTENING / standing nearby / sitting in the same enclosed or open space (room, hall, hallway, courtyard, plaza, vehicle, operating room, ship deck, cave, etc.) — even silent and not the focal subject.
@@ -2477,9 +2982,21 @@ def _infer_render_mode_from_manifest(rows: list[Any], fallback: str) -> str:
     return fallback
 
 
+_SCENE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _review_scenes_image_dir(out_dir: Path) -> Path:
+    """Thư mục ảnh beat (review/storybook): `out_dir/scenes/scene_XX.*` (legacy: root `out_dir`)."""
+    return out_dir / "scenes"
+
+
 def _scene_output_image_exists(out_dir: Path, page_number: int) -> bool:
     stem = f"scene_{int(page_number):02d}"
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+    sub = _review_scenes_image_dir(out_dir)
+    for ext in _SCENE_IMAGE_EXTS:
+        if (sub / f"{stem}{ext}").is_file():
+            return True
+    for ext in _SCENE_IMAGE_EXTS:
         if (out_dir / f"{stem}{ext}").is_file():
             return True
     return False
@@ -2487,7 +3004,12 @@ def _scene_output_image_exists(out_dir: Path, page_number: int) -> bool:
 
 def _first_existing_scene_image(out_dir: Path, page_number: int) -> Path | None:
     stem = f"scene_{int(page_number):02d}"
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+    sub = _review_scenes_image_dir(out_dir)
+    for ext in _SCENE_IMAGE_EXTS:
+        p = sub / f"{stem}{ext}"
+        if p.is_file():
+            return p
+    for ext in _SCENE_IMAGE_EXTS:
         p = out_dir / f"{stem}{ext}"
         if p.is_file():
             return p
@@ -2495,21 +3017,53 @@ def _first_existing_scene_image(out_dir: Path, page_number: int) -> Path | None:
 
 
 def _pick_reference_paths(
-    _scene: Scene,
+    scene: Scene,
     char_paths: dict[str, Path],
     style_paths: list[Path],
+    *,
+    app_mode: str = "storybook",
 ) -> list[tuple[str, Path]]:
     """
-    Mỗi cảnh đều nhận toàn bộ ảnh nhân vật + style (cùng thứ tự), giống việc chọn ref trong mangagen
-    để model luôn khóa ngoại hình nhân vật.
+    Chọn ảnh reference gửi kèm generate_content.
+
+    - storybook / manga: toàn bộ char_paths + style (legacy — khóa identity toàn cast).
+    - review: CHỈ các file trong `scene.suggestedReferences` (đúng với planner co-presence),
+      giảm TPM và tránh 429 khi section có nhiều wardrobe sheet nhưng beat chỉ 2 nhân vật.
+      Nếu resolve rỗng (filename lệch) → fallback toàn bộ char_paths.
     """
     ordered: list[tuple[str, Path]] = []
     seen: set[str] = set()
-    for label, p in char_paths.items():
-        key = str(p.resolve())
-        if key not in seen:
-            ordered.append((label, p))
-            seen.add(key)
+
+    if app_mode == "review":
+        refs_fn = list(getattr(scene, "suggested_references", None) or [])
+        if refs_fn:
+            resolved = _resolve_keyframe_ref_paths(refs_fn, char_paths)
+            if resolved:
+                for label, p in resolved:
+                    key = str(p.resolve())
+                    if key not in seen:
+                        ordered.append((label, p))
+                        seen.add(key)
+            else:
+                # Filename không khớp auto_refs — fallback an toàn
+                for label, p in char_paths.items():
+                    key = str(p.resolve())
+                    if key not in seen:
+                        ordered.append((label, p))
+                        seen.add(key)
+        else:
+            for label, p in char_paths.items():
+                key = str(p.resolve())
+                if key not in seen:
+                    ordered.append((label, p))
+                    seen.add(key)
+    else:
+        for label, p in char_paths.items():
+            key = str(p.resolve())
+            if key not in seen:
+                ordered.append((label, p))
+                seen.add(key)
+
     for p in style_paths:
         key = str(p.resolve())
         if key not in seen:
@@ -2884,7 +3438,8 @@ def generate_section_keyframe(
     """
     Sinh "section environment keyframe" = production establishing still **CHỈ bối cảnh** cho 1 outline section.
     KHÔNG vẽ nhân vật trong ảnh này. Mục đích: lock location + props + lighting + palette để các beat trong
-    section bám theo. Wardrobe nhân vật được khoá riêng qua các wardrobe sheet (section_XX__<tên>.*).
+    section bám theo. Wardrobe nhân vật được khoá riêng qua các wardrobe sheet trong
+    `section_keyframes/section_XX/<basename portrait>.*` (legacy phẳng: `section_XX__<tên>.*`).
 
     `ref_paths` / `ref_kind` được giữ trong signature cho tương thích, nhưng KHÔNG đính kèm cho prompt
     (giúp model không "lén" vẽ nhân vật vào establishing shot).
@@ -3380,22 +3935,6 @@ Do not add markdown or explanations. String values must follow standard JSON esc
 
 def _row_character_name(row: dict) -> str:
     return str(row.get("canonicalName") or row.get("name") or "").strip()
-
-
-def _dedupe_rows_by_canonical(rows: list[dict]) -> list[dict]:
-    """An toàn phía client nếu model vẫn trả trùng canonicalName (so theo casefold)."""
-    seen: set[str] = set()
-    out: list[dict] = []
-    for row in rows:
-        name = _row_character_name(row)
-        if not name:
-            continue
-        key = name.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(row)
-    return out
 
 
 def _character_row_fingerprints(row: dict) -> set[str]:
@@ -4083,8 +4622,9 @@ Current (possibly incomplete) JSON to fix and return as a single complete object
 
 Return ONLY the corrected full JSON object (same schema as before). No markdown. No commentary.
 """
-    try:
-        resp = client.models.generate_content(
+
+    def _repair_call() -> Any:
+        return client.models.generate_content(
             model=planner_model,
             contents=repair,
             config=types.GenerateContentConfig(
@@ -4092,6 +4632,14 @@ Return ONLY the corrected full JSON object (same schema as before). No markdown.
                 temperature=0.2,
             ),
         )
+
+    try:
+        resp = _generate_with_transient_retry(
+            _repair_call,
+            label=f"section bible repair sec {sec_num:02d} ({planner_model})",
+        )
+        if resp is None:
+            return None
         raw = resp.text or ""
         fixed = _json_loads_llm(_strip_json_fence(raw))
         if not isinstance(fixed, dict):
@@ -4442,6 +4990,7 @@ def _plan_one_section_wardrobe_bible(
     section_summary: str,
     char_paths: dict[str, Path],
     prev_design: dict[str, Any] | None,
+    planner_sleep_sec: float = 0.0,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """
     Plan bible cho **một** section. Trả (obj | None, required_labels).
@@ -4561,23 +5110,56 @@ Output a SINGLE JSON object describing this section. Schema:
 {hard_tail}
 """
 
-    try:
-        resp = client.models.generate_content(
-            model=planner_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.35,
-            ),
-        )
-        raw = resp.text or ""
-        obj = _json_loads_llm(_strip_json_fence(raw))
-        if not isinstance(obj, dict):
-            raise ValueError("Section design response không phải JSON object.")
-        obj["sectionNumber"] = int(sec_num)
-    except (ValueError, json.JSONDecodeError) as exc:
+    outer_lo = max(1, _WARDROBE_BIBLE_OUTER_ATTEMPTS)
+    outer_sleep = float(planner_sleep_sec) if planner_sleep_sec > 0 else 5.0
+    obj: dict[str, Any] | None = None
+
+    for attempt in range(outer_lo):
+        def _bible_plan_call() -> Any:
+            return client.models.generate_content(
+                model=planner_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.35,
+                ),
+            )
+
+        parsed_ok = False
+        try:
+            resp = _generate_with_transient_retry(
+                _bible_plan_call,
+                label=f"section wardrobe bible section {sec_num:02d} ({planner_model})",
+            )
+            if resp is None:
+                print(
+                    f"  [WARN] Section {sec_num:02d}: plan bible lần {attempt + 1}/{outer_lo} — LLM trả None.",
+                    file=sys.stderr,
+                )
+            else:
+                raw = resp.text or ""
+                obj = _json_loads_llm(_strip_json_fence(raw))
+                if not isinstance(obj, dict):
+                    raise ValueError("Section design response không phải JSON object.")
+                obj["sectionNumber"] = int(sec_num)
+                parsed_ok = True
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(
+                f"  [WARN] Section {sec_num:02d}: plan bible lần {attempt + 1}/{outer_lo} lỗi ({exc}).",
+                file=sys.stderr,
+            )
+            obj = None
+        if parsed_ok:
+            break
+        if attempt + 1 < outer_lo and outer_sleep > 0:
+            _sleep_vertex_planner_cooldown(
+                min(12.0, outer_sleep * 0.6),
+                detail=f"TPM — chờ trước retry bible section {sec_num:02d}",
+            )
+
+    if obj is None:
         print(
-            f"  [WARN] Section {sec_num:02d}: plan bible lỗi ({exc}).",
+            f"  [WARN] Section {sec_num:02d}: plan bible thất bại sau {outer_lo} lần thử (LLM/parse).",
             file=sys.stderr,
         )
         return None, required_labels
@@ -4629,6 +5211,98 @@ Output a SINGLE JSON object describing this section. Schema:
     return obj, required_labels
 
 
+def _previous_section_design_for_bible(
+    state: dict[int, dict[str, Any]],
+    sec_num: int,
+) -> dict[str, Any] | None:
+    """Section wardrobe bible continuity: bản thiết kế gần nhất có sẵn với index < sec_num."""
+    for p in range(int(sec_num) - 1, 0, -1):
+        if p in state:
+            return state[p]
+    return None
+
+
+def _fill_missing_section_designs(
+    *,
+    client: genai.Client,
+    planner_model: str,
+    story_fp: str,
+    bible_path: Path,
+    scenes: list[Scene],
+    char_paths: dict[str, Path],
+    existing: dict[int, dict[str, Any]],
+    planner_sleep_sec: float,
+) -> dict[int, dict[str, Any]]:
+    """
+    Bổ sung checkpoints/section_designs.json cho mọi outline section đã có scene
+    nhưng chưa có entry trong existing. Persist sau mỗi section thành công.
+    """
+    state: dict[int, dict[str, Any]] = dict(existing)
+    section_to_scenes: dict[int, list[Scene]] = {}
+    section_summary: dict[int, str] = {}
+    for sc in scenes:
+        sec = getattr(sc, "outline_section_number", None)
+        if sec is None:
+            continue
+        si = int(sec)
+        section_to_scenes.setdefault(si, []).append(sc)
+        if si not in section_summary and (getattr(sc, "outline_section_summary", None) or "").strip():
+            section_summary[si] = (sc.outline_section_summary or "").strip()
+    if not section_to_scenes:
+        return state
+    missing = sorted(n for n in section_to_scenes if n not in state)
+    if not missing:
+        return state
+    print(
+        f"Bible gap-fill: {len(missing)} section thiếu wardrobe design "
+        f"({', '.join(f'{n:02d}' for n in missing)}), đang bổ sung...",
+        file=sys.stderr,
+    )
+    for idx, sec_num in enumerate(missing):
+        sec_scenes = section_to_scenes[sec_num]
+        if not sec_scenes:
+            continue
+        obj, _required_labels = _plan_one_section_wardrobe_bible(
+            client=client,
+            planner_model=planner_model,
+            sec_num=sec_num,
+            sec_scenes=sec_scenes,
+            section_summary=section_summary.get(sec_num, ""),
+            char_paths=char_paths,
+            prev_design=_previous_section_design_for_bible(state, sec_num),
+            planner_sleep_sec=planner_sleep_sec,
+        )
+        if obj is not None:
+            state[sec_num] = obj
+            _persist_section_designs(
+                bible_path,
+                story_fp=story_fp,
+                planner_model=planner_model,
+                existing=state,
+            )
+            n_chars = (
+                len((obj.get("characters") or {}).keys())
+                if isinstance(obj.get("characters"), dict)
+                else 0
+            )
+            print(
+                f"  · Bible gap-fill section {sec_num:02d}: đã lưu ({n_chars} character).",
+                file=sys.stderr,
+            )
+        if planner_sleep_sec > 0 and idx < len(missing) - 1:
+            _sleep_vertex_planner_cooldown(
+                planner_sleep_sec,
+                detail="TPM — bible gap-fill, trước section kế",
+            )
+    still = sorted(n for n in section_to_scenes if n not in state)
+    if still:
+        print(
+            f"  [WARN] Bible gap-fill: vẫn thiếu {len(still)} section sau khi thử: {still}.",
+            file=sys.stderr,
+        )
+    return state
+
+
 def _plan_section_designs(
     *,
     client: genai.Client,
@@ -4638,6 +5312,7 @@ def _plan_section_designs(
     planner_model: str,
     out_dir: Path,
     regenerate: bool = False,
+    planner_sleep_sec: float = 10.0,
 ) -> dict[int, dict[str, Any]]:
     """
     Sinh "Wardrobe Bible" cho mỗi outline section: setting + per-character wardrobe.
@@ -4664,6 +5339,17 @@ def _plan_section_designs(
     sorted_sections = sorted(section_to_scenes.keys())
     if not sorted_sections:
         return existing
+
+    existing = _fill_missing_section_designs(
+        client=client,
+        planner_model=planner_model,
+        story_fp=story_fp,
+        bible_path=bible_path,
+        scenes=scenes,
+        char_paths=char_paths,
+        existing=existing,
+        planner_sleep_sec=planner_sleep_sec,
+    )
 
     # Sửa alias key cho các section đã có sẵn (vd. "Dr. Ôn" → "Ôn Đường"),
     # rồi gọi LLM repair nếu sau normalize vẫn thiếu nhân vật.
@@ -4706,7 +5392,7 @@ def _plan_section_designs(
         file=sys.stderr,
     )
 
-    for sec_num in todo:
+    for idx, sec_num in enumerate(todo):
         obj, required_labels = _plan_one_section_wardrobe_bible(
             client=client,
             planner_model=planner_model,
@@ -4714,7 +5400,8 @@ def _plan_section_designs(
             sec_scenes=section_to_scenes[sec_num],
             section_summary=section_summary.get(sec_num, ""),
             char_paths=char_paths,
-            prev_design=existing.get(sec_num - 1),
+            prev_design=_previous_section_design_for_bible(existing, sec_num),
+            planner_sleep_sec=planner_sleep_sec,
         )
         if obj is None:
             continue
@@ -4736,19 +5423,33 @@ def _plan_section_designs(
                 f"  · Section {sec_num:02d}: bible đã lưu ({n_chars} character, đủ outfit+hair).",
                 file=sys.stderr,
             )
+        if planner_sleep_sec > 0 and idx < len(todo) - 1:
+            _sleep_vertex_planner_cooldown(
+                planner_sleep_sec,
+                detail="TPM — Wardrobe Bible batch, trước section kế",
+            )
 
     _warn_section_design_wardrobe_gaps(existing, section_to_scenes, char_paths)
     return existing
 
 
+def _section_keyframes_slice_dir(out_dir: Path, sec_num: int) -> Path:
+    return out_dir / "section_keyframes" / f"section_{sec_num:02d}"
+
+
 def _existing_section_keyframe(out_dir: Path, sec_num: int) -> Path | None:
+    sec_dir = _section_keyframes_slice_dir(out_dir, sec_num)
+    for ext in _SCENE_IMAGE_EXTS:
+        for name in (f"environment{ext}", f"section_{sec_num:02d}{ext}"):
+            p = sec_dir / name
+            if p.is_file() and p.stat().st_size > 0:
+                return p
     kdir = out_dir / "section_keyframes"
-    if not kdir.is_dir():
-        return None
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        p = kdir / f"section_{sec_num:02d}{ext}"
-        if p.is_file() and p.stat().st_size > 0:
-            return p
+    if kdir.is_dir():
+        for ext in _SCENE_IMAGE_EXTS:
+            p = kdir / f"section_{sec_num:02d}{ext}"
+            if p.is_file() and p.stat().st_size > 0:
+                return p
     return None
 
 
@@ -4869,15 +5570,33 @@ def _existing_section_char_ref(
     out_dir: Path,
     sec_num: int,
     char_label: str,
+    *,
+    portrait_path: Path | None = None,
 ) -> Path | None:
+    sec_dir = _section_keyframes_slice_dir(out_dir, sec_num)
+    stems: list[str] = []
+    if portrait_path is not None:
+        try:
+            stems.append(portrait_path.stem)
+        except Exception:
+            pass
+    stems.append(_safe_filename(char_label))
+    seen_stem: set[str] = set()
+    for stem in stems:
+        if not stem or stem in seen_stem:
+            continue
+        seen_stem.add(stem)
+        for ext in _SCENE_IMAGE_EXTS:
+            p = sec_dir / f"{stem}{ext}"
+            if p.is_file() and p.stat().st_size > 0:
+                return p
     kdir = out_dir / "section_keyframes"
-    if not kdir.is_dir():
-        return None
-    safe = _safe_filename(char_label)
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        p = kdir / f"section_{sec_num:02d}__{safe}{ext}"
-        if p.is_file() and p.stat().st_size > 0:
-            return p
+    if kdir.is_dir():
+        safe = _safe_filename(char_label)
+        for ext in _SCENE_IMAGE_EXTS:
+            p = kdir / f"section_{sec_num:02d}__{safe}{ext}"
+            if p.is_file() and p.stat().st_size > 0:
+                return p
     return None
 
 
@@ -4907,6 +5626,8 @@ def _render_one_section_keyframes(
     """
     kdir = out_dir / "section_keyframes"
     kdir.mkdir(parents=True, exist_ok=True)
+    sec_dir = _section_keyframes_slice_dir(out_dir, sec_num)
+    sec_dir.mkdir(parents=True, exist_ok=True)
 
     # Lấy thông tin section từ scene list
     designs = _build_section_designs(sec_scenes)
@@ -4950,7 +5671,9 @@ def _render_one_section_keyframes(
 
             cpath: Path | None = None
             if not regenerate:
-                cpath = _existing_section_char_ref(out_dir, sec_num, char_label)
+                cpath = _existing_section_char_ref(
+                    out_dir, sec_num, char_label, portrait_path=portrait
+                )
 
             if cpath is not None:
                 print(
@@ -4987,7 +5710,7 @@ def _render_one_section_keyframes(
                 continue
 
             cext = ext_for_mime.get(cmime or "", ".png")
-            cpath = kdir / f"section_{sec_num:02d}__{_safe_filename(char_label)}{cext}"
+            cpath = sec_dir / f"{portrait.stem}{cext}"
             cpath.write_bytes(cdata)
             print(f"      -> {cpath}", file=sys.stderr)
             sec_char_map[char_label] = cpath
@@ -5040,90 +5763,10 @@ def _render_one_section_keyframes(
         return None, sec_char_map
 
     ext = ext_for_mime.get(mime or "", ".png")
-    kpath = kdir / f"section_{sec_num:02d}{ext}"
+    kpath = sec_dir / f"environment{ext}"
     kpath.write_bytes(data)
     print(f"    -> {kpath}", file=sys.stderr)
     return kpath, sec_char_map
-
-
-def _render_section_keyframes(
-    *,
-    client: genai.Client,
-    scenes: list[Scene],
-    out_dir: Path,
-    char_paths: dict[str, Path],
-    style_paths: list[Path],
-    image_model: str,
-    color_mode: str,
-    aspect_ratio: str,
-    art_style: str,
-    ext_for_mime: dict[str, str],
-    regenerate: bool,
-    render_character_refs: bool,
-    section_designs: dict[int, dict[str, Any]] | None = None,
-) -> tuple[dict[int, Path], dict[int, dict[str, Path]]]:
-    """
-    Pre-render keyframes cho mỗi outline section:
-      - 1 ảnh establishing still (section_XX.<ext>)
-      - (tùy chọn) 1 ảnh wardrobe sheet cho mỗi nhân vật xuất hiện trong section (section_XX__<tên>.<ext>)
-    Trả (section_keyframe_paths, per_section_char_paths) với:
-      - section_keyframe_paths[sec_num] = Path establishing still
-      - per_section_char_paths[sec_num][char_label] = Path wardrobe sheet
-    """
-    designs = _build_section_designs(scenes)
-    if not designs:
-        print("Không có outline section nào có present beat; bỏ qua section keyframes.", file=sys.stderr)
-        return {}, {}
-
-    kdir = out_dir / "section_keyframes"
-    kdir.mkdir(parents=True, exist_ok=True)
-    paths: dict[int, Path] = {}
-    char_paths_by_section: dict[int, dict[str, Path]] = {}
-
-    sorted_sections = sorted(designs.keys())
-    print(
-        f"Section keyframes: {len(sorted_sections)} section(s) cần render "
-        f"(skip nếu đã tồn tại trong {kdir})...",
-        file=sys.stderr,
-    )
-
-    for sec_num in sorted_sections:
-        sec_scenes = [
-            s
-            for s in scenes
-            if getattr(s, "outline_section_number", None) is not None
-            and int(s.outline_section_number) == sec_num
-        ]
-        kpath, sec_char_map = _render_one_section_keyframes(
-            client=client,
-            sec_num=sec_num,
-            sec_scenes=sec_scenes,
-            section_design=(section_designs or {}).get(sec_num),
-            out_dir=out_dir,
-            char_paths=char_paths,
-            image_model=image_model,
-            color_mode=color_mode,
-            aspect_ratio=aspect_ratio,
-            art_style=art_style,
-            ext_for_mime=ext_for_mime,
-            regenerate=regenerate,
-            render_character_refs=render_character_refs,
-        )
-        if sec_char_map:
-            char_paths_by_section[sec_num] = sec_char_map
-        if kpath is not None:
-            paths[sec_num] = kpath
-
-    print(
-        f"Section keyframes hoàn tất: {len(paths)}/{len(sorted_sections)} section"
-        + (
-            f"; per-section character refs: {sum(len(v) for v in char_paths_by_section.values())} ảnh."
-            if render_character_refs
-            else "."
-        ),
-        file=sys.stderr,
-    )
-    return paths, char_paths_by_section
 
 
 def _compact_neighbor_for_split_context(row: dict[str, Any]) -> dict[str, Any]:
@@ -5282,6 +5925,7 @@ def split_long_review_beats_in_checkpoint(
     manifest_path: Path,
     planner_model: str,
     tts_sec_threshold: float = _LONG_BEAT_AUTO_SPLIT_SEC,
+    inter_batch_sleep_sec: float = 10.0,
 ) -> int:
     """
     Tự động tách các beat review có storyText dài hơn `tts_sec_threshold` (mặc định 10s),
@@ -5398,6 +6042,7 @@ def split_long_review_beats_in_checkpoint(
             batch_size=10,
             force=False,
             review_checkpoint_path=checkpoint_path,
+            inter_batch_sleep_sec=inter_batch_sleep_sec,
         )
     return n_split_sources
 
@@ -5484,6 +6129,7 @@ def backfill_motion_prompts_in_scenes_json(
     review_checkpoint_path: Path | None = None,
     only_page_numbers: frozenset[int] | None = None,
     neighbor_radius: int = _MOTION_BACKFILL_DEFAULT_NEIGHBOR_RADIUS,
+    inter_batch_sleep_sec: float = 10.0,
 ) -> int:
     """
     Đọc scenes.json sẵn có, với mỗi beat thiếu/empty `motionPrompt` gọi planner sinh prompt
@@ -5498,6 +6144,7 @@ def backfill_motion_prompts_in_scenes_json(
 
     `only_page_numbers`: nếu set, chỉ xử lý beat có `pageNumber` nằm trong tập này; None = toàn bộ.
     `neighbor_radius`: mỗi beat trong batch đọc thêm ±N beat lân cận (ngoài batch) làm ngữ cảnh read-only.
+    `inter_batch_sleep_sec`: nghỉ sau mỗi batch planner (trước batch kế); 0 tắt. Giảm burst TPM / 429.
 
     Trả về số beat đã backfill thành công.
     """
@@ -5595,15 +6242,12 @@ def backfill_motion_prompts_in_scenes_json(
             "pageContent": page_content_raw[:280],
         }
 
-    n_filled = 0
-    for batch_idx, start in enumerate(range(0, len(targets), batch_size), start=1):
-        chunk = targets[start : start + batch_size]
-        batch_row_indices = {idx for idx, _ in chunk}
-
-        # (B) outlineSectionSummary đưa vào mỗi target để model có tonal context cho cả section.
-        target_items: list[dict[str, Any]] = []
-        for _, row in chunk:
-            target_items.append(
+    def _target_items_from_chunk(
+        chunk_pairs: list[tuple[int, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for _, row in chunk_pairs:
+            items.append(
                 {
                     "pageNumber": row.get("pageNumber"),
                     "outlineSectionNumber": row.get("outlineSectionNumber"),
@@ -5614,13 +6258,13 @@ def backfill_motion_prompts_in_scenes_json(
                     "suggestedReferences": row.get("suggestedReferences", []) or [],
                 }
             )
+        return items
 
-        # (A) Neighbor window ±neighbor_radius: với mỗi target lấy N beat trước/sau nếu CHƯA nằm
-        # trong batch. Chỉ giữ pageNumber + narrativePlane + storyText/pageContent (truncated)
-        # — KHÔNG yêu cầu motionPrompt. Cửa sổ rộng hơn giúp nhịp section + nhãn vai ổn định.
+    def _neighbor_block_for_chunk(chunk_pairs: list[tuple[int, dict[str, Any]]]) -> str:
+        batch_row_indices = {idx for idx, _ in chunk_pairs}
         neighbor_items: list[dict[str, Any]] = []
         seen_neighbor_pages: set[Any] = set()
-        for tgt_idx, _ in chunk:
+        for tgt_idx, _ in chunk_pairs:
             for off in range(-neighbor_radius, neighbor_radius + 1):
                 if off == 0:
                     continue
@@ -5635,39 +6279,56 @@ def backfill_motion_prompts_in_scenes_json(
                     continue
                 seen_neighbor_pages.add(pn_key)
                 neighbor_items.append(summary)
-        # Sắp xếp theo pageNumber để LLM đọc tuần tự.
-        neighbor_items.sort(key=lambda x: x.get("pageNumber") if isinstance(x.get("pageNumber"), int) else 0)
+        neighbor_items.sort(
+            key=lambda x: x.get("pageNumber") if isinstance(x.get("pageNumber"), int) else 0
+        )
+        if not neighbor_items:
+            return ""
+        return (
+            f"ADJACENT CONTEXT BEATS — up to {neighbor_radius} beats before and {neighbor_radius} "
+            "beats after each target (read-only — for tonal / adjacency awareness only; DO NOT "
+            "generate motionPrompt for these, they are NOT in the batch). Use them to understand "
+            f"the local motion arc across a ~{max(1, neighbor_radius * 2 + 1)}-beat window and to "
+            "keep on-screen role labels consistent with nearby pageContent / WHO IS WHERE:\n"
+            + json.dumps(neighbor_items, ensure_ascii=False, indent=2)
+            + "\n\n"
+        )
 
-        if neighbor_items:
-            neighbor_block = (
-                f"ADJACENT CONTEXT BEATS — up to {neighbor_radius} beats before and {neighbor_radius} "
-                "beats after each target (read-only — for tonal / adjacency awareness only; DO NOT "
-                "generate motionPrompt for these, they are NOT in the batch). Use them to understand "
-                f"the local motion arc across a ~{max(1, neighbor_radius * 2 + 1)}-beat window and to "
-                "keep on-screen role labels consistent with nearby pageContent / WHO IS WHERE:\n"
-                + json.dumps(neighbor_items, ensure_ascii=False, indent=2)
-                + "\n\n"
-            )
-        else:
-            neighbor_block = ""
-
+    def _fetch_motion_backfill_by_page(
+        chunk_pairs: list[tuple[int, dict[str, Any]]],
+        *,
+        log_label: str,
+    ) -> dict[int, str]:
+        if not chunk_pairs:
+            return {}
+        target_items = _target_items_from_chunk(chunk_pairs)
+        neighbor_block = _neighbor_block_for_chunk(chunk_pairs)
         prompt = f"""\
 You are filling in the MISSING field `motionPrompt` (WAN 2.1 image-to-video prompt) for a batch
 of already-planned story beats. Each beat already has a fixed `pageContent` (a static visual
 description of the still image) and `storyText` (the narration TTS). You only produce `motionPrompt`.
 
 Write motion that is READABLE on screen in ~5s: chained actions, clear facial expression, and
-reciprocal interaction when multiple roles share the frame — match the energy of strong I2V
-reference prompts (clear gestures, eye-lock, strain/pull, clenched jaw, sharp smirk), not vague
-ambient-only drift. Include ONE continuous camera path with visible zoom/dolly and/or angle/height
-drift when pageContent framing allows (no jump cuts).
-Label every mover from pageContent WHO IS WHERE + visible on-screen archetype for THAT beat's genre
-and setting — never kinship from storyText alone (father, mother, sister, a tỷ) and never
-source-language proper names.
+interaction when multiple roles share the frame, with energy CALIBRATED to the pageContent +
+storyText emotional register (see rule (c) tiers: mild / calm / tension / rescue / outburst /
+env-only). Do NOT default to the strongest tier — most beats are mild or calm; reserve strong
+vocabulary (clenched jaw, strain, sharp smirk, shoulders shaking) for beats whose pageContent
+explicitly signals confrontation, rescue, chase, or outburst.
 
-Each batch item also carries `outlineSectionSummary` — the section-level tonal arc the beat belongs
-to. Use it to keep motion intensity / mood consistent with the section's emotional register
-(e.g. climactic section → stronger kinetic verbs; reflective section → quieter body anchors).
+Include ONE continuous camera path: ONE primary move for mild / calm beats (single micro-zoom OR
+single small angle drift OR static hold; OR both micro-zoom ≤5% AND angle drift ≤5° together,
+counted as one combined gentle move; NO lateral track in mild). Up to TWO combined dimensions
+when energy tier is tension or above; lateral track allowed at tension+. No jump cuts.
+
+Label every mover from pageContent WHO IS WHERE + visible on-screen archetype for THAT beat's
+setting (modern, historical, sci-fi, fantasy, slice-of-life, kids, sports, cooking, dance,
+horror, thriller, mystery, romance, nonfiction adaptation — any genre). Never kinship from
+storyText alone (father, mother, sister, etc. in any language) and never source-language proper
+names.
+
+Each batch item also carries `outlineSectionSummary` — the section-level tonal arc the beat
+belongs to. Use it as a GUIDE for intensity, but pageContent of THIS beat always wins: a mild
+reaction beat inside a climactic section is still a mild reaction beat.
 
 {_WAN_MOTION_PROMPT_RULES}
 
@@ -5683,11 +6344,10 @@ Where adjacent context is provided (up to {neighbor_radius} beats before and {ne
 
 Output MUST be a JSON array of the SAME length and SAME order as the BATCH BEATS array, where each object has EXACTLY two keys:
   - "pageNumber" (int, matching the input pageNumber)
-  - "motionPrompt" (non-empty string, 70-120 words, following ALL rules above)
+  - "motionPrompt" (non-empty string; word range by tier: mild/calm 50–110, env-only 50–100, tension/dialogue-with-stakes 70–130, rescue/chase/outburst 80–140; following ALL rules above)
 
 Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys other than pageNumber + motionPrompt.
 """
-        first_pn_for_log = target_items[0].get("pageNumber")
 
         def _call_backfill() -> Any:
             return client.models.generate_content(
@@ -5700,45 +6360,36 @@ Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys
             )
 
         try:
-            resp = _generate_with_transient_retry(
-                _call_backfill,
-                label=f"backfill motionPrompt batch {batch_idx}/{n_total_batches} (start pageNumber={first_pn_for_log})",
-            )
+            resp = _generate_with_transient_retry(_call_backfill, label=log_label)
         except Exception as exc:  # noqa: BLE001
-            # Non-transient (vd. quota / 400) → re-raise đã handle, ở đây bắt lỗi ngoài.
             print(
-                f"  [WARN] batch bắt đầu pageNumber={first_pn_for_log} lỗi không-transient: {exc}; bỏ qua batch.",
+                f"  [WARN] {log_label}: lỗi không-transient ({exc}); bỏ qua.",
                 file=sys.stderr,
             )
-            continue
+            return {}
         if resp is None:
-            # Đã retry hết delays nhưng vẫn fail transient → skip, beat trong batch sẽ được retry
-            # ở lần chạy resume kế tiếp (vẫn nằm trong targets vì chưa có motionPrompt).
             print(
-                f"  [WARN] batch bắt đầu pageNumber={first_pn_for_log}: fail sau toàn bộ retry; "
-                "bỏ qua, lần resume kế tiếp sẽ thử lại tự động.",
+                f"  [WARN] {log_label}: fail sau toàn bộ retry transient; bỏ qua.",
                 file=sys.stderr,
             )
-            continue
+            return {}
 
         text = _strip_json_fence(getattr(resp, "text", None) or "")
         try:
             parsed = _json_loads_llm(text)
         except Exception as exc:  # noqa: BLE001
-            first_pn = target_items[0].get("pageNumber")
             print(
-                f"  [WARN] batch bắt đầu pageNumber={first_pn} không parse được JSON ({exc}); bỏ qua batch.",
+                f"  [WARN] {log_label}: không parse được JSON ({exc}); bỏ qua.",
                 file=sys.stderr,
             )
-            continue
+            return {}
 
         if not isinstance(parsed, list):
-            first_pn = target_items[0].get("pageNumber")
             print(
-                f"  [WARN] batch bắt đầu pageNumber={first_pn}: planner trả không phải array; bỏ qua.",
+                f"  [WARN] {log_label}: planner trả không phải array; bỏ qua.",
                 file=sys.stderr,
             )
-            continue
+            return {}
 
         by_page: dict[int, str] = {}
         for item in parsed:
@@ -5752,9 +6403,15 @@ Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys
                 by_page[int(pn_raw)] = mp_raw.strip()
             except (TypeError, ValueError):
                 continue
+        return by_page
 
-        batch_filled = 0
-        for _, row in chunk:
+    def _apply_motion_backfill_results(
+        chunk_pairs: list[tuple[int, dict[str, Any]]],
+        by_page: dict[int, str],
+    ) -> tuple[int, list[tuple[int, dict[str, Any]]]]:
+        filled = 0
+        still_missing: list[tuple[int, dict[str, Any]]] = []
+        for pair_idx, row in chunk_pairs:
             pn_val = row.get("pageNumber")
             try:
                 key = int(pn_val) if pn_val is not None else None
@@ -5763,13 +6420,60 @@ Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys
             mp = by_page.get(key, "") if key is not None else ""
             if mp:
                 row["motionPrompt"] = mp
-                n_filled += 1
-                batch_filled += 1
+                filled += 1
                 preview = re.sub(r"\s+", " ", mp)[:90]
                 print(f"  ✓ beat {pn_val}: {preview}…", file=sys.stderr)
             else:
+                still_missing.append((pair_idx, row))
+        return filled, still_missing
+
+    n_filled = 0
+    for batch_idx, start in enumerate(range(0, len(targets), batch_size), start=1):
+        chunk = targets[start : start + batch_size]
+        first_pn_for_log = chunk[0][1].get("pageNumber")
+        by_page = _fetch_motion_backfill_by_page(
+            chunk,
+            log_label=(
+                f"backfill motionPrompt batch {batch_idx}/{n_total_batches} "
+                f"(start pageNumber={first_pn_for_log})"
+            ),
+        )
+
+        batch_filled, still_missing = _apply_motion_backfill_results(chunk, by_page)
+        n_filled += batch_filled
+
+        for idx, row in still_missing:
+            pn_val = row.get("pageNumber")
+            try:
+                key = int(pn_val) if pn_val is not None else None
+            except (TypeError, ValueError):
+                key = None
+            if key is None:
                 print(
-                    f"  [WARN] beat {pn_val}: planner không trả motionPrompt; giữ nguyên (sẽ thử lại ở lần sau).",
+                    f"  [WARN] beat {pn_val}: pageNumber không hợp lệ; bỏ qua.",
+                    file=sys.stderr,
+                )
+                continue
+            for attempt in range(1, _MOTION_BACKFILL_MISSING_PROMPT_RETRIES + 1):
+                retry_by_page = _fetch_motion_backfill_by_page(
+                    [(idx, row)],
+                    log_label=(
+                        f"backfill motionPrompt beat {pn_val} "
+                        f"retry {attempt}/{_MOTION_BACKFILL_MISSING_PROMPT_RETRIES}"
+                    ),
+                )
+                mp = retry_by_page.get(key, "")
+                if mp:
+                    row["motionPrompt"] = mp
+                    n_filled += 1
+                    batch_filled += 1
+                    preview = re.sub(r"\s+", " ", mp)[:90]
+                    print(f"  ✓ beat {pn_val}: {preview}…", file=sys.stderr)
+                    break
+            else:
+                print(
+                    f"  [WARN] beat {pn_val}: planner không trả motionPrompt sau "
+                    f"{_MOTION_BACKFILL_MISSING_PROMPT_RETRIES} lần retry; giữ nguyên.",
                     file=sys.stderr,
                 )
 
@@ -5796,6 +6500,12 @@ Return ONLY the JSON array. No markdown fences. No commentary. No prose. No keys
                     "tiến độ trong memory chưa bị mất, vẫn tiếp tục.",
                     file=sys.stderr,
                 )
+
+        if inter_batch_sleep_sec > 0 and batch_idx < n_total_batches:
+            _sleep_vertex_planner_cooldown(
+                inter_batch_sleep_sec,
+                detail="TPM — backfill motionPrompt, trước batch kế",
+            )
 
     # Cuối cùng: đảm bảo file đã sync (nếu batch cuối không có thay đổi vẫn cần flush một lần).
     _atomic_write_json(scenes_path, rows)
@@ -5869,7 +6579,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Bỏ qua pageNumber nếu đã có scene_XX.png/jpg/webp trong thư mục -o.",
+        help="Bỏ qua pageNumber nếu đã có scenes/scene_XX.* hoặc scene_XX.* (legacy) trong -o.",
     )
     parser.add_argument(
         "--review-two-pass",
@@ -5879,7 +6589,7 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Bỏ qua portrait nhân vật đã có (auto_refs/NN_*); bỏ qua scene_XX đã render (như --skip-existing).",
+        help="Bỏ qua portrait nhân vật đã có (auto_refs/NN_*); bỏ qua beat đã render (scenes/scene_XX.* hoặc legacy như --skip-existing).",
     )
     parser.add_argument(
         "--fresh-checkpoint",
@@ -5935,10 +6645,27 @@ def main() -> None:
     parser.add_argument(
         "--fix-content-chunk-chars",
         type=int,
-        default=6000,
+        default=2200,
         metavar="N",
         help="Truyện dài hơn N ký tự sẽ được CHIA thành các chunk ~N ký tự (cắt tại biên đoạn / câu) "
-        "để fix tuần tự, retry độc lập từng chunk. Mặc định 6000. Giảm nếu hay 503/timeout.",
+        "để fix tuần tự, retry độc lập từng chunk. Mặc định 2200 (giảm payload/token, tránh 429 TPM). "
+        "Có thể tăng nhẹ (≤3000) nếu truyện rất ngắn và quota rộng.",
+    )
+    parser.add_argument(
+        "--fix-content-inter-chunk-sleep",
+        type=float,
+        default=12.0,
+        metavar="SEC",
+        help="Sau mỗi chunk content-fix **thành công**: nghỉ SEC giây trước chunk kế (hạ tốc TPM, tránh 429). "
+        "Mặc định 12 (khoảng 10–15s khuyến nghị). Đặt 0 để tắt.",
+    )
+    parser.add_argument(
+        "--planner-sleep-sec",
+        type=float,
+        default=10.0,
+        metavar="SEC",
+        help="Nghỉ SEC giữa các gọi planner lớn (Vertex TPM): review 2-pass — sau outline, giữa beat→bible inline, "
+        "giữa từng section; Wardrobe Bible batch; **giữa mỗi batch backfill motionPrompt**. Mặc định 10; 0 tắt.",
     )
     parser.add_argument(
         "--no-character-portraits",
@@ -5998,7 +6725,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path("story_output"),
-        help="Thư mục lưu scenes.json và scene_XX.png",
+        help="Thư mục lưu scenes.json và scenes/scene_XX.* (legacy: scene_XX.* ở root output)",
     )
     parser.add_argument(
         "--scenes",
@@ -6221,6 +6948,7 @@ def main() -> None:
             review_checkpoint_path=ck_for_bf if ck_for_bf.is_file() else None,
             only_page_numbers=backfill_only_page_numbers,
             neighbor_radius=backfill_neighbor_radius,
+            inter_batch_sleep_sec=float(getattr(args, "planner_sleep_sec", 10.0)),
         )
         return
 
@@ -6275,6 +7003,7 @@ def main() -> None:
                 tts_sec_threshold=float(
                     getattr(args, "split_long_beat_sec", _LONG_BEAT_AUTO_SPLIT_SEC)
                 ),
+                inter_batch_sleep_sec=float(getattr(args, "planner_sleep_sec", 10.0)),
             )
             if n_split > 0:
                 print(
@@ -6288,67 +7017,6 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-    # Pre-resume backfill: nếu checkpoint review_two_pass đã có sẵn N beat (vd. đang dở 10/19 section),
-    # fill motionPrompt cho N beat đó NGAY trước khi planner chạy tiếp các section còn lại. Nếu lần
-    # planner kế tiếp crash, 399 beat đã có vẫn an toàn (motionPrompt đã lưu cả ở scenes.json lẫn
-    # checkpoint nhờ cơ chế sync). Cũng giảm gánh nặng cho auto-backfill cuối main(): chỉ phải xử lý
-    # số beat planner mới sinh, không phải toàn bộ truyện.
-    if (
-        args.mode == "review"
-        and args.review_two_pass
-        and bool(getattr(args, "auto_backfill_motion_prompts", True))
-        and review_ck.is_file()
-        and not args.fresh_checkpoint
-    ):
-        try:
-            _ck_raw = json.loads(review_ck.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            _ck_raw = None
-        _ck_scenes = (
-            _ck_raw.get("scenes") if isinstance(_ck_raw, dict) else None
-        ) or []
-        if isinstance(_ck_scenes, list) and _ck_scenes:
-            _n_missing = sum(
-                1
-                for r in _ck_scenes
-                if isinstance(r, dict) and not (r.get("motionPrompt") or "").strip()
-            )
-            if _n_missing > 0:
-                print(
-                    f"Pre-resume backfill: checkpoint hiện có {len(_ck_scenes)} beat, "
-                    f"{_n_missing} thiếu motionPrompt. Fill ngay TRƯỚC khi planner chạy tiếp "
-                    "các section còn lại (an toàn nếu crash giữa chừng)...",
-                    file=sys.stderr,
-                )
-                _scenes_pre_path = out_dir / "scenes.json"
-                # Mirror checkpoint.scenes → scenes.json để backfill có file để đọc/ghi.
-                # Planner sẽ overwrite lại scenes.json sau mỗi section nhưng đã giữ motionPrompt
-                # nhờ _manifest_dict_to_scene → scene_to_manifest_dict bảo toàn field này.
-                try:
-                    _atomic_write_json(_scenes_pre_path, _ck_scenes)
-                except Exception as exc:  # noqa: BLE001
-                    print(
-                        f"  [WARN] không ghi được {_scenes_pre_path} ({exc}); bỏ qua pre-resume backfill.",
-                        file=sys.stderr,
-                    )
-                else:
-                    try:
-                        backfill_motion_prompts_in_scenes_json(
-                            client=client,
-                            scenes_path=_scenes_pre_path,
-                            planner_model=args.planner_model,
-                            batch_size=int(getattr(args, "backfill_batch_size", 10) or 10),
-                            force=False,
-                            review_checkpoint_path=review_ck,
-                            only_page_numbers=backfill_only_page_numbers,
-                            neighbor_radius=backfill_neighbor_radius,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        print(
-                            f"  [WARN] pre-resume backfill thất bại ({exc}); planner vẫn tiếp tục bình thường.",
-                            file=sys.stderr,
-                        )
-
     manual_char_paths = _parse_char_args(args.char)
 
     if args.fix_content:
@@ -6358,7 +7026,8 @@ def main() -> None:
             out_dir=out_dir,
             planner_model=args.planner_model,
             regenerate=bool(getattr(args, "regenerate_content_fix", False)),
-            chunk_chars=int(getattr(args, "fix_content_chunk_chars", 6000)),
+            chunk_chars=int(getattr(args, "fix_content_chunk_chars", 2200)),
+            inter_chunk_sleep_sec=float(getattr(args, "fix_content_inter_chunk_sleep", 12.0)),
         )
     else:
         print(
@@ -6423,6 +7092,202 @@ def main() -> None:
                 "(dùng cho check co-presence trong pageContent).",
                 file=sys.stderr,
             )
+
+    # Pre-resume: (1) Wardrobe Bible nếu bật section keyframe — TRƯỚC motionPrompt;
+    # (2) backfill motionPrompt. Phải chạy sau khi có char_paths + story (fix_content).
+    if (
+        args.mode == "review"
+        and args.review_two_pass
+        and review_ck.is_file()
+        and not args.fresh_checkpoint
+    ):
+        try:
+            _ck_pre = json.loads(review_ck.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _ck_pre = None
+        _ck_scenes_pre = (_ck_pre.get("scenes") if isinstance(_ck_pre, dict) else None) or []
+        if isinstance(_ck_scenes_pre, list) and _ck_scenes_pre:
+            _scene_objs_pre = [
+                _manifest_dict_to_scene(d) for d in _ck_scenes_pre if isinstance(d, dict)
+            ]
+            if _scene_objs_pre:
+                _bible_pre_resume = bool(
+                    getattr(args, "section_image_continuity", False)
+                    and getattr(args, "section_keyframe", False)
+                )
+                _sfp_pre = _story_fingerprint(story)
+                _bpath_pre = (
+                    _bible_path_for_out_dir(out_dir) if _bible_pre_resume else None
+                )
+
+                _secs_pre = {
+                    int(s.outline_section_number)
+                    for s in _scene_objs_pre
+                    if getattr(s, "outline_section_number", None) is not None
+                }
+                _outline_nums_pre: set[int] = set()
+                if isinstance(_ck_pre, dict):
+                    for _orow in _ck_pre.get("outline") or []:
+                        if isinstance(_orow, dict) and isinstance(
+                            _orow.get("sectionNumber"), int
+                        ):
+                            _outline_nums_pre.add(int(_orow["sectionNumber"]))
+                _outline_without_beats = sorted(_outline_nums_pre - _secs_pre)
+                _n_bf_pre = 0
+                if _outline_without_beats:
+                    print(
+                        f"Pre-resume: dàn ý có {len(_outline_without_beats)} section "
+                        f"({', '.join(f'{n:02d}' for n in _outline_without_beats)}) "
+                        "chưa có beat (outlineSectionNumber) — gọi planner pass-2 bù...",
+                        file=sys.stderr,
+                    )
+                    _style_pre_paths: list[Path] = []
+                    for _sp in getattr(args, "style", []) or []:
+                        _rp = _sp.expanduser().resolve()
+                        if _rp.is_file():
+                            _style_pre_paths.append(_rp)
+                    try:
+                        _n_bf_pre = _backfill_missing_outline_sections_in_review_checkpoint(
+                            client,
+                            story,
+                            checkpoint_path=review_ck,
+                            plan_manifest_path=out_dir / "scenes.json",
+                            char_paths=char_paths,
+                            style_paths=_style_pre_paths,
+                            planner_model=args.planner_model,
+                            planner_sleep_sec=float(
+                                getattr(args, "planner_sleep_sec", 10.0)
+                            ),
+                            bible_inline=_bible_pre_resume,
+                            bible_path=_bpath_pre,
+                            bible_regenerate=bool(
+                                getattr(args, "regenerate_section_designs", False)
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            f"  [WARN] Bù beat section thiếu thất bại ({exc}); "
+                            "tiếp tục các bước pre-resume khác.",
+                            file=sys.stderr,
+                        )
+                        _n_bf_pre = 0
+                    if _n_bf_pre > 0:
+                        try:
+                            _ck_pre = json.loads(review_ck.read_text(encoding="utf-8"))
+                            _ck_scenes_pre = (
+                                _ck_pre.get("scenes")
+                                if isinstance(_ck_pre, dict)
+                                else None
+                            ) or []
+                            if isinstance(_ck_scenes_pre, list) and _ck_scenes_pre:
+                                _scene_objs_pre = [
+                                    _manifest_dict_to_scene(d)
+                                    for d in _ck_scenes_pre
+                                    if isinstance(d, dict)
+                                ]
+                                _secs_pre = {
+                                    int(s.outline_section_number)
+                                    for s in _scene_objs_pre
+                                    if getattr(s, "outline_section_number", None)
+                                    is not None
+                                }
+                                _outline_without_beats = sorted(
+                                    _outline_nums_pre - _secs_pre
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                f"  [WARN] Không đọc lại checkpoint sau bù beat ({exc}).",
+                                file=sys.stderr,
+                            )
+                    if _outline_without_beats:
+                        print(
+                            f"  [WARN] Vẫn thiếu beat cho section "
+                            f"({', '.join(f'{n:02d}' for n in _outline_without_beats)}) "
+                            "— kiểm tra storyText/anchor trong outline hoặc chạy lại planner.",
+                            file=sys.stderr,
+                        )
+
+                if _bible_pre_resume and _bpath_pre is not None:
+                    _existing_pre = _load_section_designs_state(
+                        _bpath_pre,
+                        _sfp_pre,
+                        regenerate=bool(
+                            getattr(args, "regenerate_section_designs", False)
+                        ),
+                    )
+                    _miss_bible = sorted(s for s in _secs_pre if s not in _existing_pre)
+                    if _miss_bible:
+                        print(
+                            f"Pre-resume Wardrobe Bible: thiếu {len(_miss_bible)} section "
+                            f"({', '.join(f'{n:02d}' for n in _miss_bible)}) trong section_designs.json "
+                            "— bổ sung trước pre-resume motionPrompt...",
+                            file=sys.stderr,
+                        )
+                        try:
+                            _fill_missing_section_designs(
+                                client=client,
+                                planner_model=args.planner_model,
+                                story_fp=_sfp_pre,
+                                bible_path=_bpath_pre,
+                                scenes=_scene_objs_pre,
+                                char_paths=char_paths,
+                                existing=_existing_pre,
+                                planner_sleep_sec=float(
+                                    getattr(args, "planner_sleep_sec", 10.0)
+                                ),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                f"  [WARN] pre-resume Wardrobe Bible thất bại ({exc}); "
+                                "vẫn tiếp tục motionPrompt nếu cần.",
+                                file=sys.stderr,
+                            )
+
+                if bool(getattr(args, "auto_backfill_motion_prompts", True)):
+                    _n_missing_mp = sum(
+                        1
+                        for r in _ck_scenes_pre
+                        if isinstance(r, dict) and not (r.get("motionPrompt") or "").strip()
+                    )
+                    if _n_missing_mp > 0:
+                        print(
+                            f"Pre-resume backfill: checkpoint hiện có {len(_ck_scenes_pre)} beat, "
+                            f"{_n_missing_mp} thiếu motionPrompt. Fill TRƯỚC khi planner chạy tiếp "
+                            "các section còn lại (an toàn nếu crash giữa chừng)...",
+                            file=sys.stderr,
+                        )
+                        _scenes_pre_path = out_dir / "scenes.json"
+                        try:
+                            _atomic_write_json(_scenes_pre_path, _ck_scenes_pre)
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                f"  [WARN] không ghi được {_scenes_pre_path} ({exc}); "
+                                "bỏ qua pre-resume motion backfill.",
+                                file=sys.stderr,
+                            )
+                        else:
+                            try:
+                                backfill_motion_prompts_in_scenes_json(
+                                    client=client,
+                                    scenes_path=_scenes_pre_path,
+                                    planner_model=args.planner_model,
+                                    batch_size=int(
+                                        getattr(args, "backfill_batch_size", 10) or 10
+                                    ),
+                                    force=False,
+                                    review_checkpoint_path=review_ck,
+                                    only_page_numbers=backfill_only_page_numbers,
+                                    neighbor_radius=backfill_neighbor_radius,
+                                    inter_batch_sleep_sec=float(
+                                        getattr(args, "planner_sleep_sec", 10.0)
+                                    ),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                print(
+                                    f"  [WARN] pre-resume motion backfill thất bại ({exc}); "
+                                    "planner vẫn tiếp tục bình thường.",
+                                    file=sys.stderr,
+                                )
 
     style_paths = []
     for sp in args.style:
@@ -6491,6 +7356,7 @@ def main() -> None:
             bible_inline=bible_inline_enabled,
             bible_path=_bible_path_for_out_dir(out_dir) if bible_inline_enabled else None,
             bible_regenerate=bool(getattr(args, "regenerate_section_designs", False)),
+            planner_sleep_sec=float(getattr(args, "planner_sleep_sec", 10.0)),
         )
 
     manifest_path = out_dir / "scenes.json"
@@ -6554,6 +7420,7 @@ def main() -> None:
                         ),
                         only_page_numbers=backfill_only_page_numbers,
                         neighbor_radius=backfill_neighbor_radius,
+                        inter_batch_sleep_sec=float(getattr(args, "planner_sleep_sec", 10.0)),
                     )
                     # Cập nhật motion_prompt vào scenes in-memory (phòng bước sau cần dùng).
                     try:
@@ -6609,6 +7476,7 @@ def main() -> None:
                     planner_model=args.planner_model,
                     out_dir=out_dir,
                     regenerate=bool(getattr(args, "regenerate_section_designs", False)),
+                    planner_sleep_sec=float(getattr(args, "planner_sleep_sec", 10.0)),
                 )
             except Exception as exc:  # noqa: BLE001
                 print(
@@ -6672,11 +7540,48 @@ def main() -> None:
             planner_model=args.planner_model,
             out_dir=out_dir,
             regenerate=bool(getattr(args, "regenerate_section_designs", False)),
+            planner_sleep_sec=float(getattr(args, "planner_sleep_sec", 10.0)),
         )
-        # Bible đã sẵn sàng; render keyframes/sheets chuyển sang interleave just-in-time TRONG main loop
-        # (xem khối "Just-in-time" bên dưới) để mỗi section: bible → wardrobe sheets → keyframe → scenes
-        # rồi mới sang section kế. Nếu user chỉ muốn pre-render keyframes (không render scene), gọi
-        # _render_section_keyframes(...) thủ công.
+        # Bắt buộc đủ Wardrobe Bible trước khi sinh ảnh (section keyframe + continuity).
+        req_sec_nums = {
+            int(s.outline_section_number)
+            for s in scenes
+            if getattr(s, "outline_section_number", None) is not None
+        }
+        if req_sec_nums:
+            miss = sorted(n for n in req_sec_nums if n not in section_designs)
+            if miss:
+                print(
+                    f"Wardrobe Bible: còn thiếu {len(miss)} section {miss} — bổ sung lần cuối "
+                    "trước khi sinh ảnh...",
+                    file=sys.stderr,
+                )
+                _bpath = _bible_path_for_out_dir(out_dir)
+                _sfp = _story_fingerprint(story)
+                section_designs = _fill_missing_section_designs(
+                    client=client,
+                    planner_model=args.planner_model,
+                    story_fp=_sfp,
+                    bible_path=_bpath,
+                    scenes=scenes,
+                    char_paths=char_paths,
+                    existing=section_designs,
+                    planner_sleep_sec=float(getattr(args, "planner_sleep_sec", 10.0)),
+                )
+                miss2 = sorted(n for n in req_sec_nums if n not in section_designs)
+                if miss2:
+                    raise SystemExit(
+                        f"Thiếu Wardrobe Bible (checkpoints/section_designs.json) cho section {miss2}. "
+                        "Đã thử bổ sung nhưng vẫn thiếu — dừng TRƯỚC khi sinh ảnh để giữ đồng nhất trang phục/bối cảnh. "
+                        "Gợi ý: chạy `pipeline.py ... --plan-only` với `--section-image-continuity --section-keyframe` "
+                        "chỉ để điền bible; tăng `--planner-sleep-sec`; hoặc sửa tay file bible."
+                    )
+            print(
+                f"Wardrobe Bible: đủ cho {len(req_sec_nums)} outline section trước khi sinh ảnh "
+                f"({', '.join(f'{k:02d}' for k in sorted(req_sec_nums))}).",
+                file=sys.stderr,
+            )
+        # Render keyframes/sheets just-in-time TRONG main loop (mỗi section: bible → sheets → keyframe → scenes).
 
     last_present_path: Path | None = None
     last_present_scene: Scene | None = None
@@ -6753,7 +7658,7 @@ def main() -> None:
 
         if (args.skip_existing or args.resume) and _scene_output_image_exists(out_dir, idx):
             print(
-                f"Bỏ qua {label} {idx} (đã có ảnh scene_{idx:02d}.*).",
+                f"Bỏ qua {label} {idx} (đã có ảnh scenes/scene_{idx:02d}.* hoặc legacy scene_{idx:02d}.*).",
                 file=sys.stderr,
             )
             ex = _first_existing_scene_image(out_dir, idx)
@@ -6806,7 +7711,9 @@ def main() -> None:
                         n_overrides += 1
                 effective_char_paths = merged
 
-        ref_for_scene = _pick_reference_paths(scene, effective_char_paths, style_paths)
+        ref_for_scene = _pick_reference_paths(
+            scene, effective_char_paths, style_paths, app_mode=render_mode
+        )
         extras = []
         if anchor_path is not None:
             extras.append(f"anchor: {anchor_path.name}")
@@ -6854,7 +7761,9 @@ def main() -> None:
             section_design=scene_section_design,
         )
         ext = ext_for_mime.get(mime or "", ".png")
-        img_path = out_dir / f"scene_{idx:02d}{ext}"
+        scenes_dir = _review_scenes_image_dir(out_dir)
+        scenes_dir.mkdir(parents=True, exist_ok=True)
+        img_path = scenes_dir / f"scene_{idx:02d}{ext}"
         img_path.write_bytes(data)
         print(f"  -> {img_path}", file=sys.stderr)
 

@@ -8,13 +8,13 @@ Input A — manga panels (postprocess_split_panels.py):
     page_01/panels.json
     page_01/panel_01.png ...
 
-Input B — review_two_pass / scenes.json (cùng thư mục với scene_XX.png):
+Input B — review_two_pass / scenes.json (cùng thư mục với scenes/scene_XX.* hoặc legacy scene_XX.*):
   python tts_ngoc_huyen_panels.py \
     --scenes-json ./out_r2/scenes.json \
     --model /path/to/ngoc_huyen_moi.onnx \
     --output ./out_r2/audio_ngoc_huyen \
     --cuda
-  Layout mặc định review: scene_01.wav … (khớp scene_01.png). Manifest có image tương đối tới ảnh.
+  Layout mặc định review: scene_01.wav … (khớp scenes/scene_01.*). Manifest có image tương đối tới ảnh.
   --layout panels: giữ page_NN/panel_MM.wav (manga / assemble_video_from_panels cũ).
   GPU: pip install onnxruntime-gpu nvidia-cudnn-cu12; --cuda không dùng chung --force-cli.
   (Script tự thêm thư mục lib của gói nvidia-* vào LD_LIBRARY_PATH trước khi nạp ONNX — tránh lỗi libcudnn.so.9 trên WSL.)
@@ -264,15 +264,17 @@ def _iter_scenes_json(scenes_path: Path) -> list[PanelRef]:
 
 
 def _review_scene_image_relpath(images_dir: Path, audio_out_dir: Path, page_number: int) -> str:
-    """Đường dẫn ảnh minh họa (scene_XX.*) viết tương đối so với thư mục output audio."""
+    """Đường dẫn ảnh minh họa (scenes/scene_XX.* hoặc legacy scene_XX.* ở root) tương đối tới audio_out_dir."""
     stem = f"scene_{int(page_number):02d}"
     images_dir = images_dir.resolve()
     audio_out_dir = audio_out_dir.resolve()
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        p = images_dir / f"{stem}{ext}"
-        if p.is_file():
-            return os.path.relpath(p, audio_out_dir).replace("\\", "/")
-    return os.path.relpath(images_dir / f"{stem}.png", audio_out_dir).replace("\\", "/")
+    sub = images_dir / "scenes"
+    for base in (sub, images_dir):
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            p = base / f"{stem}{ext}"
+            if p.is_file():
+                return os.path.relpath(p, audio_out_dir).replace("\\", "/")
+    return os.path.relpath(sub / f"{stem}.png", audio_out_dir).replace("\\", "/")
 
 
 def _wav_path_for_beat(out_dir: Path, r: PanelRef, *, layout: str) -> Path:
@@ -590,7 +592,7 @@ def main() -> None:
         "--images-dir",
         type=Path,
         default=None,
-        help="Thư mục chứa scene_XX.png (review). Mặc định: thư mục chứa scenes.json.",
+        help="Thư mục chứa scenes/scene_XX.* hoặc scene_XX.* (review). Mặc định: thư mục chứa scenes.json.",
     )
     ap.add_argument(
         "--no-progress",
