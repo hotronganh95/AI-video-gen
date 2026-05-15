@@ -733,7 +733,7 @@ def _label_appears_in_text(label: str, text: str) -> bool:
 # Module-level character aliases map: filename → list of names (canonicalName + aliases) đã được
 # LLM trích sẵn từ truyện cụ thể. Đây là nguồn ground truth tốt nhất cho match co-presence.
 # Set bởi `_configure_character_aliases()` từ `main()`; đọc bởi `_propagate_copresent_cast_in_scenes`
-# và `_aliases_for_ref_filename`.
+# và `_enrich_review_present_suggested_refs_from_offframe_page_content` / `_aliases_for_ref_filename`.
 _CHARACTER_ALIASES_MAP: dict[str, list[str]] = {}
 
 
@@ -908,115 +908,300 @@ def _configure_character_aliases(
     _CHARACTER_ALIASES_MAP.update(new_map)
 
 
-def _propagate_copresent_cast_in_scenes(scenes: list[Scene]) -> int:
+def _who_is_where_audit_blob(page_content: str) -> str:
     """
-    CO-PRESENT CAST CLEANUP & PROPAGATION:
+    Trích phần sau ``WHO IS WHERE:`` tới cuối ``pageContent`` (khối audit SPEAKER / LISTENERS / OFF-FRAME).
 
-    Mục tiêu: trong một mạch beat liên tiếp cùng (outlineSectionNumber, narrativePlane),
-    chuẩn hoá `suggestedReferences` thành đúng những nhân vật ĐANG VẬT LÝ CÓ MẶT trong
-    không gian — bất kể có là người nói, người nghe yên lặng, hay đứng cạnh.
+    Dùng làm corpus khớp ref cho beat ``present`` để tránh false positive từ đoạn narrative
+    phía trước (nhắc nhân vật khác, thoại, hoặc alias trùng từ ngắn).
+    """
+    m = re.search(r"(?is)WHO\s+IS\s+WHERE\s*:\s*(.*)", page_content or "")
+    if not m:
+        return ""
+    return (m.group(1) or "").strip()
 
-    Quy tắc chính (rất quan trọng):
-      1) Ref được giữ / propagate KHI tên nhân vật xuất hiện trong `pageContent` (visual brief)
-         của ÍT NHẤT một beat trong mạch. Đây là tín hiệu "nhân vật được mô tả trong khung".
-      2) Ref bị LOẠI nếu chỉ xuất hiện trong `storyText` (thoại / lời kể) mà không có trong
-         `pageContent` của bất kỳ beat nào trong mạch — coi như chỉ được nhắc đến chứ không
-         có mặt vật lý (vd. nhân vật A nói về nhân vật B nhưng B không ở đó).
-      3) An toàn: nếu loại bỏ làm cho 1 beat còn 0 ref, GIỮ LẠI bộ ref cũ của riêng beat đó.
 
-    Mạch (group) bị cắt khi:
-      • outline_section_number đổi, hoặc
-      • narrative_plane đổi (present ↔ flashback).
+_SKIP_WHO_NAME_TOKENS: frozenset[str] = frozenset(
+    {
+        "narrator",
+        "the narrator",
+        "speaker",
+        "none",
+        "n/a",
+        "na",
+    }
+)
 
-    Trả về tổng số beat thay đổi (cộng add lẫn drop).
+
+def _who_token_fold(s: str) -> str:
+    return unicodedata.normalize("NFD", (s or "").strip()).casefold()
+
+
+def _parse_who_is_where_name_tokens(page_content: str) -> list[str]:
+    """
+    Tách tên từ khối ``WHO IS WHERE:`` (SPEAKER / LISTENERS / OFF-FRAME …), không đọc narrative phía trước.
+    """
+    audit = _who_is_where_audit_blob(page_content or "")
+    if not audit:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def _push_segment(seg: str) -> None:
+        for part in re.split(r",|\s+và\s+|\s+and\s+", seg, flags=re.IGNORECASE):
+            t = (part or "").strip().strip(".").strip()
+            if len(t) < 2:
+                continue
+            low = t.casefold()
+            if low in _SKIP_WHO_NAME_TOKENS:
+                continue
+            fk = _who_token_fold(t)
+            if fk not in seen:
+                seen.add(fk)
+                names.append(t)
+
+    m = re.search(
+        r"(?is)SPEAKER\s*→\s*([^;]+?)(?=;|\s*LISTENERS|\s*OFF-FRAME|$)",
+        audit,
+    )
+    if m:
+        _push_segment(m.group(1))
+    m = re.search(
+        r"(?is)LISTENERS\s+PRESENT\s*→\s*(.+?)(?=\s*\.?\s*OFF-FRAME|;|$)",
+        audit,
+    )
+    if m:
+        _push_segment(m.group(1))
+    m = re.search(
+        r"(?is)OFF-FRAME\s+but\s+in\s+scene\s*(?:→|->|:)\s*([^;.]+?)(?=\s*\.?\s*OFF-FRAME|;|$)",
+        audit,
+    )
+    if m:
+        _push_segment(m.group(1))
+    m = re.search(
+        r"(?is)OFF-FRAME\s+COMPANIONS(?:\s*\([^)]*\))?\s*:\s*([^;.]+?)(?=\s*\.?\s*OFF-FRAME|;|$)",
+        audit,
+    )
+    if m:
+        _push_segment(m.group(1))
+    return names
+
+
+def _ref_matches_who_name_allowlist(
+    ref_fn: str,
+    tokens: list[str],
+    char_paths: dict[str, Path],
+) -> bool:
+    """
+    Khớp ref với danh sách tên trong WHO: bằng nhau sau fold, hoặc surface (alias) là substring
+    đủ dài của token (vd. token ``Thái tử Tạ Chinh`` vs alias ``Tạ Chinh``).
+    """
+    if not ref_fn or not tokens or not char_paths:
+        return False
+    surfaces: list[str] = []
+    for label, p in char_paths.items():
+        try:
+            if p.name == ref_fn:
+                surfaces.append(label)
+                break
+        except Exception:
+            continue
+    surfaces.extend(_aliases_for_ref_filename(ref_fn))
+    surf_folds: list[str] = []
+    seen_sf: set[str] = set()
+    for s in surfaces:
+        s = (s or "").strip()
+        if len(s) < 2:
+            continue
+        fk = _who_token_fold(s)
+        if fk not in seen_sf:
+            seen_sf.add(fk)
+            surf_folds.append(fk)
+    if not surf_folds:
+        return False
+    tok_folds = [_who_token_fold(t) for t in tokens if (t or "").strip()]
+    for tk in tok_folds:
+        if not tk:
+            continue
+        for sf in surf_folds:
+            if tk == sf:
+                return True
+            if len(sf) >= 6 and sf in tk:
+                return True
+            if len(tk) >= 6 and tk in sf:
+                return True
+    return False
+
+
+def _ref_match_corpus_for_scene(scene: Scene) -> str:
+    """
+    Văn bản dùng để khớp ref nhân vật với đúng một beat (bất kỳ ngôn ngữ / thể loại).
+
+    - Beat hiện tại (``present``): ưu tiên khối ``WHO IS WHERE:`` trong ``page_content`` nếu có;
+      nếu planner chưa ghi audit thì fallback cả ``page_content``. Không dùng ``story_text``
+      (tránh nhắc tên ngoài khung).
+
+    - Beat ký ức (``flashback``): ``page_content`` + ``story_text`` (nối bằng newline khi cả hai có).
+
+    Rỗng → caller coi như không có substring khớp (hàm lọc giữ nguyên refs cũ nếu cần).
+    """
+    pc = (scene.page_content or "").strip()
+    st = (scene.story_text or "").strip()
+    plane = (getattr(scene, "narrative_plane", None) or "present").strip().lower()
+    if plane == "flashback":
+        if pc and st:
+            return f"{pc}\n{st}"
+        return pc or st
+    audit = _who_is_where_audit_blob(pc)
+    return audit if audit else pc
+
+
+def _offframe_name_blobs_from_page_content(page_content: str) -> str:
+    """
+    Trích phần tên sau các tiêu đề OFF-FRAME trong WHO IS WHERE (không đổi cách planner sinh pageContent).
+
+    Hỗ trợ các biến thể phổ biến:
+      • ``OFF-FRAME but in scene → ...``
+      • ``OFF-FRAME COMPANIONS (...): ...``
+    Mỗi đoạn capture tới dấu ``.`` ``;`` hoặc xuống dòng — đủ cho danh sách tên cách nhau dấu phẩy.
+    """
+    if not (page_content or "").strip():
+        return ""
+    chunks: list[str] = []
+    for m in re.finditer(
+        r"(?is)(?:"
+        r"OFF-FRAME\s+but\s+in\s+scene\s*(?:→|->|:)\s*"
+        r"|OFF-FRAME\s+COMPANIONS(?:\s*\([^)]*\))?\s*:\s*"
+        r")([^.;\n]+)",
+        page_content,
+    ):
+        piece = (m.group(1) or "").strip()
+        if piece:
+            chunks.append(piece)
+    return "\n".join(chunks)
+
+
+def _enrich_review_present_suggested_refs_from_offframe_page_content(
+    scenes: list[Scene],
+    char_paths: dict[str, Path] | None,
+) -> int:
+    """
+    Với mỗi beat ``present``, thêm vào ``suggested_references`` các portrait có tên/alias
+    xuất hiện trong blob OFF-FRAME (theo ``pageContent``). Không sửa ``pageContent``.
+    Trả về số beat đã chỉnh danh sách.
+    """
+    if not scenes or not char_paths:
+        return 0
+    n_changed = 0
+    for sc in scenes:
+        if (getattr(sc, "narrative_plane", None) or "present").strip().lower() != "present":
+            continue
+        blob = _offframe_name_blobs_from_page_content(sc.page_content or "")
+        if not blob.strip():
+            continue
+        extra: list[str] = []
+        seen_fn: set[str] = set()
+        for label in sorted(char_paths.keys()):
+            p = char_paths.get(label)
+            if p is None:
+                continue
+            try:
+                fn = p.name
+            except Exception:
+                continue
+            if not fn or fn in seen_fn:
+                continue
+            if _character_appears_in_text(fn, blob):
+                seen_fn.add(fn)
+                extra.append(fn)
+        if not extra:
+            continue
+        cur = [str(x).strip() for x in (sc.suggested_references or []) if str(x).strip()]
+        have = set(cur)
+        touched = False
+        for fn in extra:
+            if fn not in have:
+                cur.append(fn)
+                have.add(fn)
+                touched = True
+        if touched:
+            sc.suggested_references = cur
+            n_changed += 1
+    return n_changed
+
+
+def _review_postprocess_suggested_refs(
+    scenes: list[Scene],
+    char_paths: dict[str, Path] | None,
+) -> tuple[int, int]:
+    """Bổ sung OFF-FRAME (present) rồi lọc suggestedReferences theo corpus từng beat."""
+    n_enrich = _enrich_review_present_suggested_refs_from_offframe_page_content(
+        scenes, char_paths
+    )
+    if n_enrich:
+        print(
+            f"  [INFO] suggestedReferences: bổ sung ref từ OFF-FRAME trong pageContent "
+            f"(present) cho {n_enrich} beat — không sửa pageContent.",
+            file=sys.stderr,
+        )
+    n_prop = _propagate_copresent_cast_in_scenes(scenes, char_paths)
+    return n_enrich, n_prop
+
+
+def _propagate_copresent_cast_in_scenes(
+    scenes: list[Scene],
+    char_paths: dict[str, Path] | None = None,
+) -> int:
+    """
+    Lọc `suggestedReferences` theo TỪNG beat.
+
+    Quy tắc hiện tại:
+      • Present + có ``WHO IS WHERE:``: lọc theo **tên đã parse** trong audit (khớp chính xác
+        / alias dài là substring của token) — không quét narrative phía trước.
+      • Present không đủ audit / không parse được token: fallback khớp substring trên corpus
+        (WHO hoặc full ``page_content``).
+      • Flashback: khớp substring trên ``page_content`` + ``story_text``.
+      • Nếu lọc làm rỗng: giữ nguyên danh sách cũ.
     """
     if not scenes:
         return 0
 
-    def _ref_key(s: str) -> str:
-        return (s or "").strip().lower()
-
-    n_added = 0
-    n_dropped = 0
-    i = 0
-    while i < len(scenes):
-        head = scenes[i]
-        sec = getattr(head, "outline_section_number", None)
-        plane = getattr(head, "narrative_plane", None)
-        j = i + 1
-        while j < len(scenes):
-            nxt = scenes[j]
-            if (
-                getattr(nxt, "outline_section_number", None) != sec
-                or getattr(nxt, "narrative_plane", None) != plane
-            ):
-                break
-            j += 1
-
-        # Tập hợp toàn bộ ref đã được planner gán cho mạch này
-        candidates: list[str] = []
-        seen_c: set[str] = set()
-        for k in range(i, j):
-            for r in scenes[k].suggested_references or []:
-                rk = _ref_key(r)
-                if rk and rk not in seen_c:
-                    seen_c.add(rk)
-                    candidates.append(r)
-
-        # Ghép pageContent của cả mạch để kiểm tra "vật lý có mặt"
-        pc_blob = "\n".join((scenes[k].page_content or "") for k in range(i, j))
-
-        # Phân loại ref: physically present vs mention-only.
-        # Match mỗi ref qua TOÀN BỘ aliases (canonicalName + aliases LLM đã trích từ truyện)
-        # — nguồn ground truth "thông minh"; fallback dùng filename label + variants.
-        physical: list[str] = []
-        mention_only: list[str] = []
-        for r in candidates:
-            if _character_appears_in_text(r, pc_blob):
-                physical.append(r)
-            else:
-                mention_only.append(r)
-
-        # Nếu mạch không có ai vật lý → giữ nguyên (planner có thể đúng theo cách khác)
-        if not physical:
-            i = j
+    n_changed = 0
+    for sc in scenes:
+        old = list(sc.suggested_references or [])
+        if not old:
             continue
+        corpus = _ref_match_corpus_for_scene(sc)
+        plane = (getattr(sc, "narrative_plane", None) or "present").strip().lower()
+        if (
+            plane == "present"
+            and char_paths
+            and _who_is_where_audit_blob(sc.page_content or "")
+        ):
+            who_tokens = _parse_who_is_where_name_tokens(sc.page_content or "")
+            if who_tokens:
+                filtered = [
+                    r
+                    for r in old
+                    if _ref_matches_who_name_allowlist(r, who_tokens, char_paths)
+                ]
+            else:
+                filtered = [r for r in old if _character_appears_in_text(r, corpus)]
+        else:
+            filtered = [r for r in old if _character_appears_in_text(r, corpus)]
+        if not filtered:
+            continue
+        if filtered != old:
+            n_changed += 1
+            sc.suggested_references = filtered
 
-        physical_keys = {_ref_key(r) for r in physical}
-
-        for k in range(i, j):
-            old = list(scenes[k].suggested_references or [])
-            old_keys = {_ref_key(r) for r in old}
-
-            # add: các ref vật lý có mặt thiếu khỏi beat này
-            added = [r for r in physical if _ref_key(r) not in old_keys]
-            # drop: các ref hiện có nhưng không thuộc nhóm vật lý (mention-only)
-            dropped = [r for r in old if _ref_key(r) not in physical_keys]
-
-            new_refs = [r for r in old if _ref_key(r) in physical_keys] + added
-
-            # An toàn: không để beat còn 0 ref. Nếu drop → 0 thì rollback drop, chỉ thêm.
-            if not new_refs:
-                new_refs = list(old) + added
-                dropped = []
-
-            if added:
-                n_added += 1
-            if dropped:
-                n_dropped += 1
-
-            scenes[k].suggested_references = new_refs
-
-        i = j
-
-    if n_added or n_dropped:
+    if n_changed:
         print(
-            f"  [INFO] Co-present cast cleanup: thêm refs cho {n_added} beat, "
-            f"loại refs chỉ-được-nhắc-trong-thoại khỏi {n_dropped} beat "
-            "(giữ đúng những người vật lý có mặt trong cảnh).",
+            f"  [INFO] suggestedReferences: đã lọc theo từng beat (present+có WHO: token audit; "
+            f"khác: corpus chuỗi; flashback: pageContent+storyText) — {n_changed} beat.",
             file=sys.stderr,
         )
-    return n_added + n_dropped
+    return n_changed
 
 
 def _parse_panels_from_row(raw: Any, max_count: int) -> list[dict[str, Any]]:
@@ -1778,14 +1963,15 @@ For each beat:
      For LISTENERS PRESENT: list each physically co-present person ONCE (do not repeat the SPEAKER if they are the only focal subject).
    FLASHBACK BEATS (narrativePlane="flashback") — suggestedReferences MUST follow the MEMORY FRAME ONLY:
    • The flashback image is a different time/place from the surrounding "present" thread. suggestedReferences MUST include ONLY characters who are VISIBLY SHOWN or explicitly co-present INSIDE THIS recalled scene (exactly as in THIS beat's pageContent + WHO IS WHERE).
-   • DO NOT add characters who belong only to the outer present-day scene (e.g. emperor / generals / hunt companions in the current royal hunt) unless they literally appear as figures inside THIS memory frame.
+   • DO NOT add characters who belong only to the outer present-timeline scene unless they literally appear as figures inside THIS memory frame.
    • If pageContent describes only two people in the memory room, suggestedReferences MUST be ONLY those two matching filenames — never pad with present-thread cast "because the section has them".
    • If the prose names someone not drawn in the memory image, do NOT add their ref; express them as dialogue/memory text only, not as an extra ref.
+   • Downstream validation may check flashback beats against BOTH pageContent and storyText together (verbatim source names often appear only in storyText while pageContent carries the image brief). Keep storyText for a flashback beat co-extensive with the visible memory slice only — do not include unrelated names who are not in that frame.
    MUST INCLUDE (add the filename to suggestedReferences):
      • The SPEAKER of this beat (if they have a ref).
      • Anyone LISTENING / standing nearby / sitting in the same enclosed or open space (room, hallway, hall, courtyard, plaza, cabin, vehicle, hospital ward, cave, spaceship deck, etc.) — even silent and not the focal subject.
      • Anyone the prose explicitly describes as physically present (generic patterns: "<relative> stands behind me", "<authority figure> sits at the head of the table", "<rival> leans on the doorframe" — substitute the actual names from THIS story; do not copy these placeholders).
-     • In a continuous conversation / interaction at THE SAME location: the SAME co-present cast must appear in refs for ALL beats in that thread — wide → medium → OTS → close-up → reaction shot → extreme close-up — until the prose explicitly says someone leaves or the scene moves to a different time/place.
+     • Co-presence stays true in pageContent (background / OTS / OFF-FRAME COMPANIONS when framing is tight), but suggestedReferences is PER BEAT: include a filename only if that person is named in THIS beat's pageContent or WHO IS WHERE line (do not carry the whole room's cast list from a wide shot into an ECU unless you still name them there).
    MUST EXCLUDE (do NOT add to suggestedReferences):
      • Characters merely MENTIONED in dialogue / narration but NOT physically present.
        Generic example: A says "you only want X to notice you" but X is not in the scene → DO NOT add X.
@@ -1793,11 +1979,12 @@ For each beat:
      • Characters who left in a previous scene/location.
      • Characters that exist only inside the inner-monologue of a present beat.
      • Unnamed crowds / extras without a portrait ref.
+   • EACH beat is independent: suggestedReferences MUST list ONLY people named in THIS beat's pageContent / WHO IS WHERE (including OFF-FRAME companions). Do NOT copy refs from the previous or next beat just because the conversation continues — a tight ECU lists only whoever is still named there.
    If a present beat contains a brief recollection of someone who is not there → keep refs for the physically present cast only; render the recollection inside pageContent as "the protagonist's expression briefly recalls <memory subject>" WITHOUT drawing the absent person.
    Order: section-protagonist(s) first, then in narrative order of appearance.
    Pattern (replace placeholders with the right Available Assets filenames + character names from THIS story):
-     Two characters A and B converse inside the same room; the wide shot and every close-up / ECU within that thread keep refs for BOTH because both are physically present.
-     A subsequent beat whose dialogue mentions a third character C who is NOT in the room → refs are [A, B] only; do NOT add C.
+     Wide establishing beat names A and B in pageContent / WHO IS WHERE → refs [A, B]. A later extreme close-up on A only names A (and optionally B in OFF-FRAME) → refs are only those still named in THAT beat's pageContent — not every ref from the establishing shot by default.
+     A beat whose dialogue mentions C who is not in the room → do NOT add C's ref.
 8. narrativePlane: "present" or "flashback" (required).
 
 {_WAN_MOTION_PROMPT_RULES}
@@ -1999,7 +2186,9 @@ def _backfill_missing_outline_sections_in_review_checkpoint(
             )
             continue
         beats_data = _parse_planner_json_array(b_resp.text or "", client, planner_model)
-        chunk_scenes = _manifest_rows_to_scenes(beats_data, story, "review")
+        chunk_scenes = _manifest_rows_to_scenes(
+            beats_data, story, "review", char_paths=char_paths
+        )
         if not chunk_scenes:
             print(
                 f"  [WARN] Bù beat section {sec_num:02d}: planner trả rỗng / không parse được — bỏ qua.",
@@ -2033,8 +2222,7 @@ def _backfill_missing_outline_sections_in_review_checkpoint(
         completed_nums.add(sec_num)
 
         _dedupe_review_story_text_overlaps(all_scenes)
-        if _propagate_copresent_cast_in_scenes(all_scenes):
-            pass
+        _review_postprocess_suggested_refs(all_scenes, char_paths)
         _persist_review_two_pass_data(
             checkpoint_path=checkpoint_path,
             plan_manifest_path=plan_manifest_path,
@@ -2293,7 +2481,7 @@ Return ONLY a JSON array of objects with keys:
             )
             _persist(outline_sorted, completed_nums, all_scenes)
         _warn_long_story_text_beats(all_scenes)
-        _propagate_copresent_cast_in_scenes(all_scenes)
+        _review_postprocess_suggested_refs(all_scenes, char_paths)
         print(
             f"Tiếp tục từ checkpoint: {len(completed_nums)}/{len(outline_sorted)} đoạn dàn ý, "
             f"{len(all_scenes)} beat.",
@@ -2478,7 +2666,9 @@ Return ONLY a JSON array of objects with keys:
                 "Chạy lại lệnh với cùng --output để resume; hoặc đổi --planner-model gemini-2.5-pro."
             )
         beats_data = _parse_planner_json_array(b_resp.text or "", client, planner_model)
-        chunk_scenes = _manifest_rows_to_scenes(beats_data, story, "review")
+        chunk_scenes = _manifest_rows_to_scenes(
+            beats_data, story, "review", char_paths=char_paths
+        )
         outline_summary = sec_summary_line
         for s in chunk_scenes:
             global_idx += 1
@@ -2591,7 +2781,8 @@ Return ONLY a JSON array of objects with keys:
         )
         _persist(outline_sorted, completed_nums, all_scenes)
     _warn_long_story_text_beats(all_scenes)
-    if _propagate_copresent_cast_in_scenes(all_scenes):
+    n_e, n_p = _review_postprocess_suggested_refs(all_scenes, char_paths)
+    if n_e or n_p:
         _persist(outline_sorted, completed_nums, all_scenes)
 
     return all_scenes
@@ -2815,21 +3006,23 @@ For each beat, define:
      "WHO IS WHERE: SPEAKER → <name or 'narrator'>; LISTENERS PRESENT → <name>, <name>; OFF-FRAME but in scene → <name> (only if needed)."
      For LISTENERS PRESENT: each physically co-present person ONCE (do not repeat the SPEAKER as listener if they are the sole speaker in frame).
    FLASHBACK BEATS (narrativePlane="flashback") — suggestedReferences = MEMORY FRAME ONLY:
-   • Include ONLY characters visibly depicted or explicitly co-present INSIDE this recalled scene (this beat's pageContent + WHO IS WHERE). NEVER add present-thread-only cast (current hunt, throne room, etc.) unless they literally appear inside THIS memory image.
+   • Include ONLY characters visibly depicted or explicitly co-present INSIDE this recalled scene (this beat's pageContent + WHO IS WHERE). NEVER add present-thread-only cast unless they literally appear inside THIS memory image.
    • If only two people appear in the flashback room, suggestedReferences MUST be exactly those two filenames — do not pad with section-wide cast.
+   • Downstream validation may check flashback beats against BOTH pageContent and storyText together (verbatim source names often appear only in storyText while pageContent carries the image brief). Keep storyText for a flashback beat co-extensive with the visible memory slice only — do not include unrelated names who are not in that frame.
    MUST INCLUDE:
      • The SPEAKER of this beat (if they have a ref).
      • Anyone LISTENING / standing nearby / sitting in the same enclosed or open space (room, hall, hallway, courtyard, plaza, vehicle, operating room, ship deck, cave, etc.) — even silent and not the focal subject.
      • Anyone the prose explicitly describes as physically present.
-     • In a continuous conversation / interaction at THE SAME location: the SAME co-present cast must appear in refs for ALL beats in that thread (wide → close-up → OTS → ECU) until someone leaves or the scene moves elsewhere.
+     • Co-presence stays true in pageContent (background / OTS / OFF-FRAME COMPANIONS when framing is tight), but suggestedReferences is PER BEAT: include a filename only if that person is named in THIS beat's pageContent or WHO IS WHERE (do not copy the whole thread's cast into a tight ECU unless you still name them there).
    MUST EXCLUDE:
      • Characters merely MENTIONED in dialogue / narration but NOT physically present (generic example: a line refers to "a third party" who is not in the room → DO NOT add their ref).
      • Characters who left in the previous scene/location.
      • Characters who only exist inside an inner-monologue / brief recollection of a present beat (express the memory as a thought cue on someone PRESENT, do NOT draw the absent person).
      • Unnamed crowds / extras without a portrait ref.
+   • EACH beat is independent: suggestedReferences MUST list ONLY people named in THIS beat's pageContent / WHO IS WHERE (including OFF-FRAME companions). Do NOT copy refs from adjacent beats.
    Pattern (replace placeholders with the right Available Assets filenames + character names from THIS story):
-     - two characters physically in the same room → every beat in that conversation thread keeps refs for BOTH (wide through ECU).
-     - a beat whose dialogue mentions a third character not in the frame → do NOT add a ref for that third character.
+     - wide beat names A and B → refs [A, B]; a later ECU on A that only names A (+ optional OFF-FRAME B) → refs only for whoever is still named in THAT beat — not automatic [A,B] from the wide shot.
+     - dialogue mentions a third character not in the frame → do NOT add that ref.
 8. narrativePlane: "present" or "flashback" (required).
 
 {_WAN_MOTION_PROMPT_RULES}
@@ -2879,13 +3072,15 @@ Return ONLY a JSON array of objects with the keys:
     raw = response.text or ""
     data = _parse_planner_json_array(raw, client, planner_model)
 
-    return _manifest_rows_to_scenes(data, story, app_mode)
+    return _manifest_rows_to_scenes(data, story, app_mode, char_paths=char_paths)
 
 
 def _manifest_rows_to_scenes(
     data: list[Any],
     story: str,
     app_mode: str,
+    *,
+    char_paths: dict[str, Path] | None = None,
 ) -> list[Scene]:
     """Chuyển mảng object planner/manifest (scenes.json) thành list Scene."""
     if not isinstance(data, list):
@@ -2969,7 +3164,7 @@ def _manifest_rows_to_scenes(
                 file=sys.stderr,
             )
         _warn_long_story_text_beats(scenes)
-        _propagate_copresent_cast_in_scenes(scenes)
+        _review_postprocess_suggested_refs(scenes, char_paths)
     return scenes
 
 
@@ -5555,6 +5750,23 @@ def _detect_section_characters(
     return found
 
 
+def _char_paths_basename_index(char_paths: dict[str, Path]) -> dict[str, str]:
+    """
+    basename file portrait trong auto_refs (vd. ``01_Linh_Lung.png``) → key ``char_paths``
+    (nhãn nhân vật). Dùng để map ``suggestedReferences`` sang nhãn khi chỉ merge một subset
+    wardrobe sheet của section.
+    """
+    idx: dict[str, str] = {}
+    for label, p in char_paths.items():
+        try:
+            name = p.name
+        except Exception:
+            continue
+        if name and name not in idx:
+            idx[name] = label
+    return idx
+
+
 def _resolve_keyframe_ref_paths(
     ref_filenames: list[str],
     char_paths: dict[str, Path],
@@ -7330,13 +7542,13 @@ def main() -> None:
                 f"(khác --mode {args.mode!r}).",
                 file=sys.stderr,
             )
-        scenes = _manifest_rows_to_scenes(plan_data, story, render_mode)
+        scenes = _manifest_rows_to_scenes(
+            plan_data, story, render_mode, char_paths=char_paths
+        )
         print(
             f"Đã load {len(scenes)} cảnh từ {plan_path} (bỏ qua planner).",
             file=sys.stderr,
         )
-        if render_mode == "review":
-            _propagate_copresent_cast_in_scenes(scenes)
     else:
         _plan_label = {
             "manga": "trang manga",
@@ -7605,6 +7817,7 @@ def main() -> None:
     section_anchor_paths: dict[object, Path] = {}
     present_run_id = 0  # tăng mỗi khi gặp flashback (reset run continuity)
     rendered_section_keyframes: set[int] = set()  # các section đã chạy _render_one_section_keyframes
+    char_basename_index = _char_paths_basename_index(char_paths)
 
     def _is_present(sc: Scene) -> bool:
         return (getattr(sc, "narrative_plane", None) or "present").strip().lower() == "present"
@@ -7713,18 +7926,24 @@ def main() -> None:
                     if anc is not None and anc.is_file():
                         anchor_path = anc
 
-        # Nếu section có per-character wardrobe sheet → ưu tiên dùng thay cho portrait gốc.
+        # Chỉ thay portrait bằng wardrobe sheet trong section_keyframes khi nhân vật nằm trong
+        # suggestedReferences của beat này (không gộp cả cast section — tránh nhầm log và đồng bộ API).
         effective_char_paths = char_paths
         n_overrides = 0
         if use_section_char_refs and sec_n is not None:
             sec_overrides = section_char_ref_paths.get(int(sec_n)) or {}
             if sec_overrides:
                 merged = dict(char_paths)
-                for lbl, p in sec_overrides.items():
-                    if p.is_file():
+                for fn in scene.suggested_references or []:
+                    lbl = char_basename_index.get((fn or "").strip())
+                    if not lbl:
+                        continue
+                    p = sec_overrides.get(lbl)
+                    if p is not None and p.is_file():
                         merged[lbl] = p
                         n_overrides += 1
-                effective_char_paths = merged
+                if n_overrides:
+                    effective_char_paths = merged
 
         ref_for_scene = _pick_reference_paths(
             scene, effective_char_paths, style_paths, app_mode=render_mode
@@ -7737,7 +7956,7 @@ def main() -> None:
         ):
             extras.append(f"prev: {continuity_path.name}")
         if n_overrides:
-            extras.append(f"section-char-refs: {n_overrides}")
+            extras.append(f"section-char-refs (theo suggestedReferences): {n_overrides}")
         if extras:
             print(
                 f"Đang render {label} {idx} (kèm {', '.join(extras)})...",
